@@ -32,6 +32,30 @@ def _write_bed(path: Path, rows):
         path.write_text(text)
 
 
+class ManifestTests(unittest.TestCase):
+    def test_make_manifest_lists_bed_files(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            beds = tmp / "references"
+            beds.mkdir()
+            (beds / "IHECRE00000001_B_Lymphocyte.chr21.bed.gz").write_bytes(b"")
+            (beds / "IHECRE00000002.bed").write_bytes(b"")
+            (beds / "notes.txt").write_text("skip")
+            out = tmp / "manifest.tsv"
+            self.assertEqual(main([
+                "make-manifest", "--panel-dir", str(beds), "--output", str(out),
+            ]), 0)
+            lines = out.read_text().splitlines()
+            self.assertEqual(lines[0], "path\tsample_id\tgroup\tchrom")
+            body = [line.split("\t") for line in lines[1:]]
+            ids = [row[1] for row in body]
+            self.assertEqual(ids, ["IHECRE00000001", "IHECRE00000002"])
+            self.assertEqual(body[0][3], "chr21")
+            self.assertEqual(body[1][3], "")
+            self.assertTrue((tmp / body[0][0]).exists())
+
+
 class ParserTests(unittest.TestCase):
     def test_formats_keep_zero_and_large_counts(self):
         root = Path(self.id().split(".")[-1])

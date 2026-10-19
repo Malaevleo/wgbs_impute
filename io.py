@@ -158,6 +158,76 @@ def mean_positive_cov(cov: np.ndarray) -> float:
     return float(pos.mean()) if len(pos) else 0.0
 
 
+def sample_id_from_filename(path: Path) -> str:
+    """`IHECRE00000155_B_Lymphocyte.chr21.bed.gz` -> `IHECRE00000155`."""
+    name = path.name
+    if name.endswith(".gz"):
+        name = name[:-3]
+    for suffix in (".cpg.bed", ".bed", ".cov", ".tsv"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    token = name.split("_", 1)[0].split(".", 1)[0]
+    return token or name
+
+
+def chrom_from_filename(path: Path) -> str:
+    import re
+    match = re.search(r"\.(chr(?:[0-9]+|X|Y|M))\.", path.name, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def iter_panel_files(panel_dir: Path) -> list[Path]:
+    """BED and gzipped BED files in one directory, not in subfolders."""
+    panel_dir = Path(panel_dir)
+    found = []
+    for path in panel_dir.iterdir():
+        if not path.is_file():
+            continue
+        name = path.name.lower()
+        if name.endswith(".bed") or name.endswith(".bed.gz"):
+            found.append(path)
+    return sorted(found)
+
+
+def write_manifest(panel_dir: Path, output: Path) -> list[dict]:
+    """Write path, sample_id, group, chrom. group is left blank."""
+    import csv
+
+    files = iter_panel_files(panel_dir)
+    if not files:
+        raise ParseError(f"{panel_dir}: no .bed or .bed.gz files")
+    output = Path(output)
+    rows = []
+    seen: dict[str, int] = {}
+    for path in files:
+        sid = sample_id_from_filename(path)
+        if sid in seen:
+            seen[sid] += 1
+            sid = f"{sid}_{seen[sid]}"
+        else:
+            seen[sid] = 1
+        try:
+            rel = path.resolve().relative_to(output.parent.resolve())
+            stored = str(rel)
+        except ValueError:
+            stored = str(path.resolve())
+        rows.append({
+            "path": stored,
+            "sample_id": sid,
+            "group": "",
+            "chrom": chrom_from_filename(path),
+        })
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="") as fh:
+        writer = csv.DictWriter(
+            fh, fieldnames=["path", "sample_id", "group", "chrom"], delimiter="\t", lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    return rows
+
+
 def read_manifest(path: Path) -> list[dict]:
     import csv
 

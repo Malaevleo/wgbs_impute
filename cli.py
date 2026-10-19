@@ -6,12 +6,17 @@ import argparse
 from pathlib import Path
 
 from wgbs_impute.impute import impute_query, parse_kappa_arg
+from wgbs_impute.io import write_manifest
 from wgbs_impute.panel import prepare_panel
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="wgbs_impute")
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    make = sub.add_parser("make-manifest", help="list BED files in a directory as a panel manifest")
+    make.add_argument("--panel-dir", type=Path, required=True)
+    make.add_argument("--output", type=Path, required=True)
 
     prep = sub.add_parser("prepare-panel", help="cache a reference panel, one chromosome at a time")
     prep.add_argument("--manifest", type=Path, required=True)
@@ -57,6 +62,10 @@ def main(argv: list[str] | None = None) -> int:
     imp.add_argument("--refnn-k", type=int, default=5)
 
     args = parser.parse_args(argv)
+    if args.cmd == "make-manifest":
+        rows = write_manifest(args.panel_dir, args.output)
+        print(f"wrote {len(rows)} libraries to {args.output}", flush=True)
+        return 0
     if args.cmd == "prepare-panel":
         prepare_panel(
             args.manifest, args.cache, min_ref_mean_cov=args.min_ref_mean_cov,
