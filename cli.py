@@ -17,6 +17,12 @@ def main(argv: list[str] | None = None) -> int:
     make = sub.add_parser("make-manifest", help="list BED files in a directory as a panel manifest")
     make.add_argument("--panel-dir", type=Path, required=True)
     make.add_argument("--output", type=Path, required=True)
+    make.add_argument("--disease-dir", type=Path, default=None,
+                      help="extra folder of disease libraries to add to the panel")
+    make.add_argument("--disease-table", type=Path, default=None,
+                      help="TSV with epirr, disease, and optional role; default samples.tsv next to --disease-dir")
+    make.add_argument("--disease-role", default="ref", choices=("ref", "target", "all"),
+                      help="which rows of the disease table to add (default: ref)")
 
     prep = sub.add_parser("prepare-panel", help="cache a reference panel, one chromosome at a time")
     prep.add_argument("--manifest", type=Path, required=True)
@@ -67,7 +73,11 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "sd_passthrough", None) is None and args.cmd != "make-manifest":
         args.sd_passthrough = 0.0 if getattr(args, "preset", "pairwise") == "research" else 5.0
     if args.cmd == "make-manifest":
-        rows = write_manifest(args.panel_dir, args.output)
+        rows = write_manifest(
+            args.panel_dir, args.output,
+            disease_dir=args.disease_dir, disease_table=args.disease_table,
+            disease_role=args.disease_role,
+        )
         print(f"wrote {len(rows)} libraries to {args.output}", flush=True)
         return 0
     if args.cmd == "prepare-panel":

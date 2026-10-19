@@ -91,6 +91,32 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(body[1][3], "")
             self.assertTrue((tmp / body[0][0]).exists())
 
+    def test_disease_dir_adds_reference_libraries_only(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            healthy = tmp / "healthy"
+            disease = tmp / "disease"
+            healthy.mkdir()
+            disease.mkdir()
+            (healthy / "IHECRE00000001.chr21.bed").write_bytes(b"")
+            (disease / "IHECRE00000009.chr21.tsv").write_text("1\t10\t50\n")
+            (disease / "IHECRE00000010.chr21.tsv").write_text("1\t10\t50\n")
+            (disease / "samples.tsv").write_text(
+                "role\tepirr\tdisease\nref\tIHECRE00000009\tAML\ntarget\tIHECRE00000010\tCLL\n"
+            )
+            out = tmp / "manifest.tsv"
+            self.assertEqual(main([
+                "make-manifest", "--panel-dir", str(healthy), "--disease-dir", str(disease),
+                "--output", str(out),
+            ]), 0)
+            body = [line.split("\t") for line in out.read_text().splitlines()[1:]]
+            ids = [row[1] for row in body]
+            groups = {row[1]: row[2] for row in body}
+            self.assertEqual(ids, ["IHECRE00000001", "IHECRE00000009"])
+            self.assertEqual(groups["IHECRE00000009"], "AML")
+            self.assertEqual(groups["IHECRE00000001"], "")
+
 
 class ParserTests(unittest.TestCase):
     def test_formats_keep_zero_and_large_counts(self):

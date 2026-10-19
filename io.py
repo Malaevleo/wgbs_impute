@@ -177,36 +177,95 @@ def chrom_from_filename(path: Path) -> str:
     return match.group(1) if match else ""
 
 
-def iter_panel_files(panel_dir: Path) -> list[Path]:
-    """BED and gzipped BED files in one directory, not in subfolders."""
+def iter_panel_files(panel_dir: Path, *, caches: bool = False) -> list[Path]:
+    """Library files in one directory, not in subfolders.
+
+    Healthy panels are BED files. Disease folders in this project are also
+    `start cov pct` caches named `SAMPLE.chr21.tsv`, so those are included
+    when `caches` is set. `samples.tsv` is a table, not a library.
+    """
     panel_dir = Path(panel_dir)
     found = []
     for path in panel_dir.iterdir():
         if not path.is_file():
             continue
         name = path.name.lower()
+        if name in {"samples.tsv", "manifest.tsv"}:
+            continue
         if name.endswith(".bed") or name.endswith(".bed.gz"):
+            found.append(path)
+        elif caches and (name.endswith(".tsv") or name.endswith(".tsv.gz")):
             found.append(path)
     return sorted(found)
 
 
-def write_manifest(panel_dir: Path, output: Path) -> list[dict]:
-    """Write path, sample_id, group, chrom. group is left blank."""
+def read_disease_table(path: Path) -> dict[str, dict]:
+    """Map sample id to disease and role. Accepts `epirr` or `sample_id`."""
     import csv
 
-    files = iter_panel_files(panel_dir)
+    out = {}
+    with Path(path).open() as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if not reader.fieldnames:
+            raise ParseError(f"{path}: disease table needs a header")
+        id_col = "sample_id" if "sample_id" in reader.fieldnames else "epirr"
+        if id_col not in reader.fieldnames or "disease" not in reader.fieldnames:
+            raise ParseError(f"{path}: disease table needs disease and epirr or sample_id")
+        for row in reader:
+            sid = (row.get(id_col) or "").strip()
+            if not sid:
+                continue
+            out[sid] = {
+                "disease": (row.get("disease") or "").strip(),
+                "role": (row.get("role") or "").strip(),
+            }
+    return out
+
+
+def write_manifest(
+    panel_dir: Path,
+    output: Path,
+    disease_dir: Path | None = None,
+    disease_table: Path | None = None,
+    disease_role: str = "ref",
+) -> list[dict]:
+    """Write path, sample_id, group, chrom.
+
+    Healthy rows leave group blank. Disease rows set group to the disease
+    name. With a table that has a role column, only `disease_role` is added
+    unless that argument is `all`.
+    """
+    import csv
+
+    files = [(path, "") for path in iter_panel_files(panel_dir)]
+    labels = {}
+    if disease_dir is not None:
+        table = Path(disease_table) if disease_table else None
+        if table is None:
+            for candidate in (Path(disease_dir) / "samples.tsv", Path(disease_dir).parent / "samples.tsv"):
+                if candidate.exists():
+                    table = candidate
+                    break
+        if table is not None:
+            labels = read_disease_table(table)
+        for path in iter_panel_files(disease_dir, caches=True):
+            sid = sample_id_from_filename(path)
+            info = labels.get(sid, {})
+            role = info.get("role", "")
+            if labels and role and disease_role != "all" and role != disease_role:
+                continue
+            files.append((path, info.get("disease") or Path(disease_dir).name))
     if not files:
-        raise ParseError(f"{panel_dir}: no .bed or .bed.gz files")
+        raise ParseError(f"{panel_dir}: no library files")
     output = Path(output)
     rows = []
-    seen: dict[str, int] = {}
-    for path in files:
+    seen: set[str] = set()
+    for path, group in files:
         sid = sample_id_from_filename(path)
         if sid in seen:
-            seen[sid] += 1
-            sid = f"{sid}_{seen[sid]}"
-        else:
-            seen[sid] = 1
+            print(f"warning: {sid} already in the manifest, skipping {path.name}", flush=True)
+            continue
+        seen.add(sid)
         try:
             rel = path.resolve().relative_to(output.parent.resolve())
             stored = str(rel)
@@ -215,7 +274,7 @@ def write_manifest(panel_dir: Path, output: Path) -> list[dict]:
         rows.append({
             "path": stored,
             "sample_id": sid,
-            "group": "",
+            "group": group,
             "chrom": chrom_from_filename(path),
         })
     output.parent.mkdir(parents=True, exist_ok=True)
