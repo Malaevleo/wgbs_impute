@@ -32,6 +32,42 @@ def _write_bed(path: Path, rows):
         path.write_text(text)
 
 
+class ResearchPresetTests(unittest.TestCase):
+    def test_research_predict_matches_the_audit_function(self):
+        import os
+        import sys
+        root = Path("/Users/leonidmalaev/Desktop/adna")
+        os.environ.setdefault("MPLBACKEND", "Agg")
+        sys.path.insert(0, str(root))
+        from audit_opus.run_opus import blup_predict_v
+        from run_local_imputation import select_neighbors as old_select
+        from run_local_imputation import znorm_rows
+        from wgbs_impute.blup import predict_research, research_neighbors
+
+        rng = np.random.default_rng(1)
+        n, r = 40, 12
+        pos = np.arange(n) * 200
+        beta10 = np.clip(rng.normal(0.6, 0.2, size=(n, r)), 0.02, 0.98)
+        beta1 = beta10.copy()
+        hole = rng.random((n, r)) < 0.2
+        beta1[hole] = rng.random((n, r))[hole]
+        beta10[rng.random((n, r)) < 0.1] = np.nan
+        q = np.clip(rng.normal(0.5, 0.2, size=n), 0.0, 1.0)
+        q[rng.random(n) < 0.3] = np.nan
+        qc = rng.integers(0, 8, size=n).astype(np.float64)
+        eval_idx = np.arange(0, n, 2)
+        z, mask = znorm_rows(beta10)
+        old_nb = old_select(pos, z, mask, eval_idx, 5000, 8, 5)
+        new_mat = research_neighbors(pos, beta10, 5000, 8, 5, sites=eval_idx)
+        new_nb = [new_mat[i][new_mat[i] >= 0] for i in eval_idx]
+        for a, b in zip(old_nb, new_nb):
+            self.assertEqual(list(a), list(b))
+        pm = np.nanmean(beta10, axis=1) * 100.0
+        old = blup_predict_v(beta10, beta1, q, qc, eval_idx, old_nb, pm, 0.25, 6, 0.05)
+        new = predict_research(beta10, beta1, q, qc, eval_idx, new_nb, pm, 0.25, 6, 0.05)
+        self.assertTrue(np.allclose(old, new, equal_nan=True))
+
+
 class ManifestTests(unittest.TestCase):
     def test_make_manifest_lists_bed_files(self):
         import tempfile

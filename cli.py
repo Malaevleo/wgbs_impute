@@ -26,7 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     prep.add_argument("--window", type=int, default=25000)
     prep.add_argument("--neighbors", type=int, default=30)
     prep.add_argument("--shrink", type=float, default=0.25)
-    prep.add_argument("--sd-passthrough", type=float, default=5.0)
+    prep.add_argument("--sd-passthrough", type=float, default=None)
+    prep.add_argument("--preset", choices=("pairwise", "research"), default="pairwise")
     prep.add_argument("--seed", type=int, default=42)
 
     imp = sub.add_parser("impute", help="impute low-coverage CpGs with fused BLUP")
@@ -49,7 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     imp.add_argument("--shrink", type=float, default=0.25)
     imp.add_argument("--noise-floor", type=float, default=0.05)
     imp.add_argument("--neighbor-min-cov", type=int, default=1)
-    imp.add_argument("--sd-passthrough", type=float, default=5.0)
+    imp.add_argument("--sd-passthrough", type=float, default=None)
+    imp.add_argument("--preset", choices=("pairwise", "research"), default="pairwise")
     imp.add_argument("--fuse", dest="fuse_on", action="store_true", default=True)
     imp.add_argument("--no-fuse", dest="fuse_on", action="store_false")
     imp.add_argument("--kappa", default=None)
@@ -62,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
     imp.add_argument("--refnn-k", type=int, default=5)
 
     args = parser.parse_args(argv)
+    if getattr(args, "sd_passthrough", None) is None and args.cmd != "make-manifest":
+        args.sd_passthrough = 0.0 if getattr(args, "preset", "pairwise") == "research" else 5.0
     if args.cmd == "make-manifest":
         rows = write_manifest(args.panel_dir, args.output)
         print(f"wrote {len(rows)} libraries to {args.output}", flush=True)
@@ -71,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
             args.manifest, args.cache, min_ref_mean_cov=args.min_ref_mean_cov,
             min_ref_site_cov=args.min_ref_site_cov, window=args.window,
             neighbors=args.neighbors, shrink=args.shrink,
-            sd_passthrough=args.sd_passthrough, seed=args.seed,
+            sd_passthrough=args.sd_passthrough, seed=args.seed, preset=args.preset,
         )
         return 0
     if not args.panel_cache and not args.panel_manifest:
@@ -87,6 +91,6 @@ def main(argv: list[str] | None = None) -> int:
         kappa=parse_kappa_arg(args.kappa), threads=args.threads, seed=args.seed,
         methods=[m.strip() for m in args.method.split(",") if m.strip()],
         local_iterations=args.local_iterations, local_depth=args.local_depth,
-        max_train=args.max_train, refnn_k=args.refnn_k,
+        max_train=args.max_train, refnn_k=args.refnn_k, preset=args.preset,
     )
     return 0

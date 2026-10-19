@@ -12,9 +12,9 @@ from pathlib import Path
 import numpy as np
 
 from wgbs_impute import __version__
-from wgbs_impute.blup import blup_gates, context_one, fuse, select_neighbors, site_factors
+from wgbs_impute.blup import blup_gates, context_one, fuse
 from wgbs_impute.io import in_regions, mean_positive_cov, read_regions, read_sites
-from wgbs_impute.panel import choose_refs, load_chrom, load_root, prepare_panel
+from wgbs_impute.panel import _fit_chrom, choose_refs, load_chrom, load_root, prepare_panel
 
 CORE = ("blup", "panel_mean", "neighbor_mean")
 OPTIONAL = ("local", "global", "comet", "hmm", "kalman")
@@ -50,6 +50,7 @@ def impute_query(
     kappa=None,
     threads: int = 1,
     seed: int = 42,
+    preset: str = "pairwise",
     methods: list[str] | None = None,
     local_iterations: int = 120,
     local_depth: int = 4,
@@ -67,7 +68,7 @@ def impute_query(
         prepare_panel(
             panel_manifest, cache, min_ref_mean_cov=min_ref_mean_cov,
             min_ref_site_cov=min_ref_site_cov, window=window, neighbors=neighbors,
-            shrink=shrink, sd_passthrough=sd_passthrough, seed=seed,
+            shrink=shrink,             sd_passthrough=sd_passthrough, seed=seed, preset=preset,
         )
     root = load_root(cache)
     region_map = read_regions(regions) if regions else None
@@ -87,7 +88,7 @@ def impute_query(
             shrink=shrink, noise_floor=noise_floor, neighbor_min_cov=neighbor_min_cov,
             sd_passthrough=sd_passthrough, max_cov=max_cov, only_below=only_below,
             score_all=score_all, fuse_on=fuse_on, kappa=kappa, regions=region_map,
-            seed=seed, threads=threads, local_iterations=local_iterations,
+            seed=seed, threads=threads, preset=preset, local_iterations=local_iterations,
             local_depth=local_depth, max_train=max_train, refnn_k=refnn_k,
         )
         rows.extend(packed)
@@ -117,7 +118,7 @@ def impute_query(
             methods=methods, max_cov=max_cov, fuse=fuse_on, window=window,
             neighbors=neighbors, shrink=shrink, noise_floor=noise_floor,
             sd_passthrough=sd_passthrough, n_refs=n_refs, sample_id=sample_id,
-            seed=seed, threads=threads,
+            seed=seed, threads=threads, preset=preset,
         )),
         "panel_sample_ids": used_ids,
         "chromosomes": chrom_stats,
@@ -151,6 +152,7 @@ def _impute_chrom(cache, chrom, tab, root, methods, **opt):
         and opt["window"] == root["window"]
         and opt["neighbors"] == root["neighbors"]
         and opt["shrink"] == root["shrink"]
+        and opt.get("preset", "pairwise") == root.get("preset", meta.get("preset", "pairwise"))
     )
     pos = np.asarray(data["pos"])
     if same:
@@ -162,11 +164,14 @@ def _impute_chrom(cache, chrom, tab, root, methods, **opt):
         cov_p = np.asarray(data["cov"])
     else:
         beta = np.asarray(data["beta10"][:, ids])
+        beta1 = np.asarray(data["beta1"][:, ids])
         meth_p = np.asarray(data["meth"][:, ids])
         cov_p = np.asarray(data["cov"][:, ids])
         min_ok, min_ov = blup_gates(len(ids))
-        neigh = select_neighbors(pos, beta, opt["window"], opt["neighbors"], min_ov)
-        factors = site_factors(beta, neigh, opt["shrink"], min_ok)
+        neigh, factors = _fit_chrom(
+            pos, beta, beta1, opt["window"], opt["neighbors"], opt["shrink"],
+            min_ok, min_ov, opt.get("preset", "pairwise"),
+        )
     min_ok, _ = blup_gates(beta.shape[1] if not same else len(meta["sample_ids"]))
     q_pos = tab["start"]
     loc = np.searchsorted(pos, q_pos)
@@ -216,7 +221,10 @@ def _impute_chrom(cache, chrom, tab, root, methods, **opt):
             rows.append(_row(chrom, start, end, cov, meth, _blank_pred(factors, j), "observed", methods, opt["fuse_on"], observed=True))
             n_written += 1
             continue
-        pred, n_nb, solved = _context_at(j, neigh, factors, q_beta, q_cov, min_ok, opt["noise_floor"], sd_cut)
+        pred, n_nb, solved = _context_at(
+            j, neigh, factors, q_beta, q_cov, min_ok, opt["noise_floor"], sd_cut,
+            clip_query=opt.get("preset") == "research",
+        )
         stable = sd_cut > 0 and float(factors["panel_sd"][j]) < sd_cut
         if solved:
             n_solved += 1
@@ -259,7 +267,7 @@ def _impute_chrom(cache, chrom, tab, root, methods, **opt):
     return rows, stat, [meta["sample_ids"][i] for i in ids]
 
 
-def _context_at(j, neigh, factors, q_beta, q_cov, min_ok, floor, sd_cut):
+def _context_at(j, neigh, factors, q_beta, q_cov, min_ok, floor, sd_cut, clip_query=False):
     nb = neigh[j]
     nb = nb[nb >= 0]
     sd = float(factors["panel_sd"][j])
@@ -273,6 +281,7 @@ def _context_at(j, neigh, factors, q_beta, q_cov, min_ok, floor, sd_cut):
         np.asarray(factors["snn"][j, : len(nb), : len(nb)], dtype=np.float64),
         q_beta[nb], q_cov[nb], int(factors["n_label"][j]), min_ok, floor, mean,
         bool(np.isfinite(factors["mu"][j]) and len(nb) >= 2 and int(factors["n_label"][j]) >= min_ok),
+        clip_query=clip_query,
     )
 
 

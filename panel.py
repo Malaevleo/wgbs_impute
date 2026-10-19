@@ -13,6 +13,7 @@ from wgbs_impute.blup import (
     blup_gates,
     calibrate,
     context_one,
+    research_neighbors,
     select_neighbors,
     site_factors,
 )
@@ -41,6 +42,7 @@ def prepare_panel(
     sd_passthrough: float = 5.0,
     seed: int = 42,
     kappa_sites: int = 2000,
+    preset: str = "pairwise",
 ) -> dict:
     rows = read_manifest(Path(manifest))
     libraries = []
@@ -68,13 +70,14 @@ def prepare_panel(
         "shrink": shrink,
         "min_ref_site_cov": min_ref_site_cov,
         "sd_passthrough": sd_passthrough,
+        "preset": preset,
         "chromosomes": chroms,
     }
     (cache / "meta.json").write_text(json.dumps(meta, indent=2))
     for chrom in chroms:
         _prepare_chrom(
             cache, chrom, libraries, min_ref_site_cov, window, neighbors, shrink,
-            sd_passthrough, seed, kappa_sites,
+            sd_passthrough, seed, kappa_sites, preset,
         )
         print(f"prepared {chrom}: {len(libraries)} libraries", flush=True)
     return meta
@@ -82,7 +85,7 @@ def prepare_panel(
 
 def _prepare_chrom(
     cache, chrom, libraries, min_site_cov, window, neighbors, shrink,
-    sd_passthrough, seed, kappa_sites,
+    sd_passthrough, seed, kappa_sites, preset,
 ):
     present = [lib for lib in libraries if chrom in lib["sites"]]
     if len(present) < 2:
@@ -109,8 +112,7 @@ def _prepare_chrom(
             if ci >= min_site_cov:
                 beta10[i, j] = mi / ci
     min_ok, min_ov = blup_gates(r)
-    neigh = select_neighbors(pos, beta10, window, neighbors, min_ov)
-    factors = site_factors(beta10, neigh, shrink, min_ok)
+    neigh, factors = _fit_chrom(pos, beta10, beta1, window, neighbors, shrink, min_ok, min_ov, preset)
     # Stable sites do not need a stored factorization. Keep the panel mean.
     low = factors["panel_sd"] < sd_passthrough
     factors["solvable"][low] = False
@@ -131,8 +133,8 @@ def _prepare_chrom(
     np.save(dest / "snn.npy", factors["snn"])
     np.save(dest / "solvable.npy", factors["solvable"])
     kappa = _kappa_grid(
-        pos, beta10, meth, cov, present, window, neighbors, shrink,
-        sd_passthrough, seed, kappa_sites,
+        pos, beta10, beta1, meth, cov, present, window, neighbors, shrink,
+        sd_passthrough, seed, kappa_sites, preset,
     )
     (dest / "meta.json").write_text(json.dumps({
         "sample_ids": [lib["sample_id"] for lib in present],
@@ -140,22 +142,35 @@ def _prepare_chrom(
         "mean_cov": [lib["mean_cov"] for lib in present],
         "kappa_depths": list(KAPPA_DEPTHS),
         "kappa": kappa,
+        "preset": preset,
     }))
 
 
+def _fit_chrom(pos, beta10, beta1, window, neighbors, shrink, min_ok, min_ov, preset):
+    if preset == "research":
+        neigh = research_neighbors(pos, beta10, window, neighbors, min_ov)
+        factors = site_factors(beta10, neigh, shrink, min_ok, beta_x=beta1, filled=True)
+    elif preset == "pairwise":
+        neigh = select_neighbors(pos, beta10, window, neighbors, min_ov)
+        factors = site_factors(beta10, neigh, shrink, min_ok)
+    else:
+        raise SystemExit(f"unknown preset {preset}")
+    return neigh, factors
+
+
 def _kappa_grid(
-    pos, beta10, meth, cov, present, window, neighbors, shrink,
-    sd_passthrough, seed, kappa_sites,
+    pos, beta10, beta1, meth, cov, present, window, neighbors, shrink,
+    sd_passthrough, seed, kappa_sites, preset,
 ) -> list[float]:
     means = np.array([lib["mean_cov"] for lib in present])
     hold = int(np.argmax(means))
     keep = [j for j in range(beta10.shape[1]) if j != hold]
     if len(keep) < 2:
         return [8.0 for _ in KAPPA_DEPTHS]
-    sub = beta10[:, keep]
     min_ok, min_ov = blup_gates(len(keep))
-    neigh = select_neighbors(pos, sub, window, neighbors, min_ov)
-    factors = site_factors(sub, neigh, shrink, min_ok)
+    neigh, factors = _fit_chrom(
+        pos, beta10[:, keep], beta1[:, keep], window, neighbors, shrink, min_ok, min_ov, preset,
+    )
     eligible = np.flatnonzero(
         (factors["panel_sd"] >= sd_passthrough) & factors["solvable"] & np.isfinite(factors["panel_mean"])
     )
@@ -185,8 +200,9 @@ def _kappa_grid(
                 factors["mu_n"][i, : len(nb)].astype(np.float64),
                 factors["sin"][i, : len(nb)].astype(np.float64),
                 factors["snn"][i, : len(nb), : len(nb)].astype(np.float64),
-                q_beta, c[nb].astype(np.float64), int(factors["n_label"][i]), min_ok, 0.05,
+                q_beta, c[nb].astype(np.float64),                 int(factors["n_label"][i]), min_ok, 0.05,
                 float(factors["panel_mean"][i]), bool(factors["solvable"][i]),
+                clip_query=(preset == "research"),
             )
         out.append(calibrate(pred, truth[eligible]))
     return out

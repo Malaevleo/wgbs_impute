@@ -16,6 +16,8 @@ python -m wgbs_impute impute --query query.bed.gz --panel-cache panel_cache/ --o
 
 `make-manifest` looks in that directory only, not in subfolders, for `.bed` and `.bed.gz`. The sample id is the part of the filename before the first `_` or `.`, so `IHECRE00000155_B_Lymphocyte.chr21.bed.gz` becomes `IHECRE00000155`. Fill in `group` yourself if you want lineage labels. If the query's `sample_id` is in the manifest, it is removed from the references at impute time.
 
+`--preset research` uses the BLUP from the chromosome-21 audits: neighbors ranked by a cosine of z-scored rows, and missing reference values filled with the column mean before the covariance. That is the estimator behind the published scores. The default `--preset pairwise` keeps a pair only when both references observed it. Research mode also solves stable sites instead of replacing them with the panel mean.
+
 By default, sites with coverage below 10 are fused BLUP and sites at 10 or above keep the observed percent. `--only-below` writes just the low-coverage rows. `--no-fuse` writes the context prediction. `--method` adds other columns: `panel_mean`, `neighbor_mean`, `local`, `global`, `comet`, `hmm`, `kalman`. Local and global need CatBoost and are off unless named.
 
 ## Inputs
