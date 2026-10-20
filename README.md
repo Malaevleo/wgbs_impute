@@ -23,6 +23,21 @@ python -m wgbs_impute --help
 
 `requirements.txt` installs NumPy and CatBoost, including the methods `local` and `global`. Comet, the copying HMM, and the Kalman smoother use NumPy only. A path ending in `.gz` is written with `bgzip` when that program is installed, and with ordinary gzip otherwise.
 
+## Docker
+
+The image runs the same three commands. Mount the reference BED directory, the query file, and an output directory.
+
+```bash
+docker build -t wgbs-impute .
+docker run --rm \
+  -v /data/references:/refs:ro \
+  -v /data/query.bed.gz:/query/query.bed.gz:ro \
+  -v /data/out:/out \
+  wgbs-impute --preset research
+```
+
+`/out` receives `imputed.bed.gz`, `stats.tsv`, `stats_by_coverage.tsv`, `stats_by_sd.tsv`, and `dashboard.html`. `docker run --rm -v "$PWD/demo_out":/out wgbs-impute --demo` builds a synthetic panel inside the container and checks that imputation beats the panel mean.
+
 ## Quickstart
 
 Put the reference BED files in one directory. `make-manifest` writes a table that points at each file. `prepare-panel` reads those files once and stores the panel. `impute` uses that store on a low-coverage query.
