@@ -22,10 +22,18 @@ jobs:
       - run: cd "$RUNNER_TEMP" && python -m unittest discover -s "$GITHUB_WORKSPACE/tests" -v
       - run: cd "$RUNNER_TEMP" && wgbs-impute --help && wgbs-impute-docker --demo --out "$RUNNER_TEMP/demo"
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t wgbs-impute:ci .
-      - run: docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,size=256m wgbs-impute:ci --demo --out /tmp/demo
-      - run: docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,size=256m --entrypoint python wgbs-impute:ci -m unittest discover -s /build/tests -v
+      - id: build
+        run: docker build -t wgbs-impute:ci .
+      - name: Regression tests
+        run: docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,size=256m --entrypoint python wgbs-impute:ci -m unittest discover -s /build/tests -v
+      - name: Demo accuracy check
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,size=256m wgbs-impute:ci --demo --out /tmp/demo

@@ -44,6 +44,26 @@ def _write_bed(path: Path, rows):
 
 
 class ResearchPresetTests(unittest.TestCase):
+    def test_correlation_strength_precedes_distance(self):
+        from wgbs_impute.blup import _rank_neighbors
+
+        pos = np.array([0, 100, 1000])
+        chosen = _rank_neighbors(pos, 0, np.array([1, 2]), np.array([0.8, -0.9]), 1)
+        self.assertEqual(list(chosen), [2])
+
+    def test_equal_correlations_choose_nearest_sites_despite_roundoff(self):
+        from wgbs_impute.blup import research_neighbors
+
+        pos = np.arange(9) * 100
+        profile = np.array([0.1, 0.2, 0.4, 0.6, 0.8, 0.9])
+        for perturb in (0.0, 1e-14):
+            beta = np.tile(profile, (len(pos), 1))
+            beta += np.random.default_rng(7).normal(size=beta.shape) * perturb
+            for select in (research_neighbors, select_neighbors):
+                with self.subTest(selector=select.__name__, perturb=perturb):
+                    neighbors = select(pos, beta, window=1000, k=2, min_overlap=4)
+                    self.assertEqual(list(neighbors[4]), [3, 5])
+
     def test_research_cached_factors_match_direct_solver(self):
         from wgbs_impute.blup import predict_research, research_neighbors
         from wgbs_impute.impute import _context_at

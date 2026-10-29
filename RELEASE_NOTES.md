@@ -1,3 +1,12 @@
+# 0.2.1
+
+- Resolve tied neighbor correlations consistently by genomic distance, then position. Ranking keys are rounded to 12 decimal places to avoid CPU/BLAS roundoff changing the selected neighbor set; covariance still uses the original values.
+- Add regressions for exact ties, roundoff-level perturbations, and correlation priority over distance. The demo retains its requirement to beat the panel-mean baseline.
+- Replace the demo's random latent levels with evenly spaced levels from 0.15 to 0.85. The held-out sample now has a deliberately distinct profile, making recovery a meaningful expectation at 2x coverage rather than depending on a randomly near-average query. Add the real demo to the regression suite; do not interpret it as a guarantee of improvement on all queries.
+- Run Docker CI natively on both AMD64 and ARM64, and run the demo even when regression tests fail so both results are visible.
+- Cache schema 3 invalidates old neighbor selections. Rebuild caches made by earlier versions; cached neighbors cannot be repaired by rerunning imputation alone.
+- Local validation: all 32 tests passed in offline, read-only Docker containers on native ARM64 and emulated AMD64. The controlled demo returned fused MAE 5.206 versus panel MAE 36.273 on both. GitHub's native runner checks still need to run after pushing; the original screenshot's exact failing score was not reproduced under emulation.
+
 # 0.2.0
 
 - Package installation and console entry points replace parent-directory/PYTHONPATH setup.

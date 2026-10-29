@@ -13,7 +13,14 @@ from unittest.mock import patch
 import numpy as np
 
 from wgbs_impute.cli import main
-from wgbs_impute.docker_entry import main as docker_main, render_dashboard, run_pipeline, summarize, write_bed
+from wgbs_impute.docker_entry import (
+    main as docker_main,
+    render_dashboard,
+    run_demo,
+    run_pipeline,
+    summarize,
+    write_bed,
+)
 from wgbs_impute.impute import impute_query, parse_kappa_arg
 from wgbs_impute.io import ParseError, read_manifest, read_sites, write_manifest
 from wgbs_impute.panel import load_root, prepare_panel
@@ -49,6 +56,16 @@ class ProductionTests(unittest.TestCase):
         manifest = self.root / "manifest.tsv"
         write_manifest(refs, manifest)
         return refs, manifest
+
+    def test_demo_recovers_known_signal_above_panel_mean_baseline(self):
+        out = self.root / "demo"
+        self.assertEqual(run_demo(out), 0)
+        rows = table(out / "imputed.tsv")
+        self.assertEqual(len(rows), 400)
+        self.assertGreaterEqual(sum(r["cov"] == "0" for r in rows), 200)
+        self.assertTrue(all(0 <= float(r["pct"]) <= 100 for r in rows))
+        report = json.loads((out / "imputed.tsv.run.json").read_text())
+        self.assertNotIn("lib0", report["panel_sample_ids"])
 
     def test_split_chromosomes_preserve_identity_and_exclusion(self):
         _, manifest = self.panel(True)

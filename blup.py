@@ -74,6 +74,19 @@ def znorm_rows(mat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return z, obs.astype(np.float64)
 
 
+def _rank_neighbors(pos, site, candidates, scores, k):
+    """Rank by |correlation|, resolving numerical ties by distance then position.
+
+    Round only the ranking key to 12 decimal places so BLAS roundoff does not
+    select different sets of otherwise equivalent CpGs on different CPUs.
+    Covariance estimation continues to use the original methylation values.
+    """
+    strength = np.round(np.clip(np.abs(scores), 0.0, 1.0), decimals=12)
+    distance = np.abs(pos[candidates] - pos[site])
+    order = np.lexsort((pos[candidates], distance, -strength))
+    return candidates[order[:k]]
+
+
 def research_neighbors(
     pos: np.ndarray,
     beta: np.ndarray,
@@ -109,9 +122,7 @@ def research_neighbors(
             overlap = mask[i] @ mask[cand].T
             corr = z[i] @ z[cand].T
         corr = np.where((overlap >= min_overlap) & np.isfinite(corr), corr, 0.0)
-        take = np.argpartition(np.abs(corr), -k)[-k:]
-        take = take[np.argsort(-np.abs(corr[take]))]
-        out[i, :k] = cand[take]
+        out[i, :k] = _rank_neighbors(pos, i, cand, corr, k)
     return out
 
 
@@ -175,8 +186,8 @@ def select_neighbors(
         keep = np.flatnonzero(corr > 0)
         if len(keep) == 0:
             continue
-        order = keep[np.argsort(-corr[keep])][:k]
-        out[i, : len(order)] = cand[order]
+        take = _rank_neighbors(pos, i, cand[keep], corr[keep], k)
+        out[i, : len(take)] = take
     return out
 
 

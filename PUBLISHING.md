@@ -10,9 +10,9 @@ python -m pip install '.[ml,dev]'
 ruff check .
 python -m unittest discover -s tests -v
 python -m build
-docker build -t wgbs-impute:0.2.0 .
+docker build -t wgbs-impute:0.2.1 .
 docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,size=256m \
-  wgbs-impute:0.2.0 --demo --out /tmp/demo
+  wgbs-impute:0.2.1 --demo --out /tmp/demo
 git diff --check
 git diff
 ```

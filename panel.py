@@ -23,7 +23,7 @@ from wgbs_impute.io import read_manifest, read_sites
 from wgbs_impute.thinning import subsample_depths
 from wgbs_impute.validation import validate_chrom, validate_options
 
-CACHE_SCHEMA = 2
+CACHE_SCHEMA = 3
 KAPPA_DEPTHS = (2.0, 5.0, 10.0, 20.0)
 
 

@@ -86,7 +86,7 @@ Read counts must be integers with `0 <= methylated <= coverage`, and coverage mu
 
 Defaults: ±25 kb window, 30 neighbors, covariance shrinkage 0.25, query noise floor 0.05, reference-library mean coverage strictly above 10, reference-site coverage at least 10. These parameters are configurable; use `--help` for all flags. Sites at query coverage 10 or above retain observed methylation by default. `--only-below` omits those rows. `--score-all` also computes prediction columns at deep sites; it cannot be combined with `--only-below`.
 
-The default `pairwise` preset uses covariance estimated from jointly observed references and sends sites with panel SD below 5 percentage points to the panel mean. The `research` preset ranks neighbors by cosine similarity of standardized rows, fills missing reference values with column means before covariance estimation, and disables this SD cutoff. `--sd-passthrough` changes the cutoff explicitly.
+The default `pairwise` preset uses covariance estimated from jointly observed references and sends sites with panel SD below 5 percentage points to the panel mean. The `research` preset ranks neighbors by cosine similarity of standardized rows, fills missing reference values with column means before covariance estimation, and disables this SD cutoff. Both presets round absolute correlation ranking keys to 12 decimal places and break ties by distance, then genomic position, so numerical roundoff does not arbitrarily change equally correlated neighbors. Covariance uses the original values. `--sd-passthrough` changes the cutoff explicitly.
 
 Fusion strength κ is calibrated using held-out reference reads, without fitting to the query. Calibration is recalculated when the selected references or fitting parameters change. `--kappa 8` overrides calibration; a two-column `depth kappa` table is also accepted. `--no-fuse` selects the context prediction. A coverage-zero site's fused prediction equals its context prediction.
 
@@ -99,10 +99,10 @@ The TSV includes original counts, observed percent, selected output percent (`pc
 The container installs the package, includes all optional runtime dependencies pinned in `requirements-docker.lock`, and runs as UID/GID 10001. It requires no network at runtime. The base image receives upstream updates when rebuilt; refresh the dependency lock deliberately and run CI when updating it.
 
 ```bash
-docker build -t wgbs-impute:0.2.0 .
+docker build -t wgbs-impute:0.2.1 .
 mkdir -p demo_out
 docker run --rm --network none --user "$(id -u):$(id -g)" \
-  -v "$PWD/demo_out:/out" wgbs-impute:0.2.0 --demo
+  -v "$PWD/demo_out:/out" wgbs-impute:0.2.1 --demo
 ```
 
 For a real run, create an **empty** writable output directory, mount references and query read-only, and preserve the query's identity or supply it explicitly:
@@ -112,7 +112,7 @@ docker run --rm --network none --user "$(id -u):$(id -g)" \
   -v /data/references:/refs:ro \
   -v /data/query.bed.gz:/query/query.bed.gz:ro \
   -v /data/out:/out \
-  wgbs-impute:0.2.0 --preset research --sample-id SAMPLE
+  wgbs-impute:0.2.1 --preset research --sample-id SAMPLE
 ```
 
 Container input/output paths are configurable with `--refs`, `--query`, and `--out`. Its default preset is `research`; the Python CLI defaults to `pairwise`. `--format`, `--chrom`, `--include-panel-sites`, `--max-cov`, `--only-below`, `--method`, `--n-refs`, `--disease-role`, `--sample-id`, fitting parameters, `--kappa`, `--threads`, `--seed`, and `--no-fuse` are available. The wrapper prepares a fresh panel each run. For repeated queries against one prepared panel, invoke the installed core CLI with `--entrypoint wgbs-impute` and mount the cache.
@@ -127,7 +127,7 @@ Statistics compare output values with available query observations; these differ
 
 Covariance matrices are fitted one site at a time rather than storing an `n_sites × neighbors × neighbors` tensor. Panel files are spooled to temporary arrays during preparation, and chromosomes are processed separately. Output rows and container summaries are streamed; exact SD medians retain 8 bytes per site per summary group. Panel beta/count arrays and neighbor indices still scale with sites × references and sites × neighbors. Parsing one input library and the query requires memory proportional to their input size. Optional methods may allocate additional dense arrays. Use chromosome-split inputs and `--chrom` for large workloads, and benchmark memory on your cohort before whole-genome deployment.
 
-The synthetic demo checks software behavior and improvement over a panel-mean baseline; it does not validate accuracy for every tissue, species, or assay. Validate an appropriate held-out cohort before relying on scientific results.
+The synthetic demo checks software behavior and improvement over a panel-mean baseline using a controlled, recoverable signal: reference levels span 0.15–0.85, and the held-out query is at 0.15. It does not validate accuracy for every tissue, species, or assay. A real query close to the panel mean may not improve over that baseline. Validate an appropriate held-out cohort before relying on scientific results.
 
 ## Development and migration
 
@@ -140,4 +140,4 @@ python -m build
 
 CI tests Python 3.10–3.13 installations, builds distribution artifacts, and runs the demo and regressions inside a non-root, read-only Docker container without runtime networking. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for behavior changes and [PUBLISHING.md](PUBLISHING.md) for GitHub push instructions.
 
-Version 0.2.0 uses cache schema 2. **Rebuild older caches.** Regenerate old Bismark-derived caches because their coordinates were previously interpreted incorrectly. Never reuse a 0.1.x cache by copying or editing its metadata.
+Version 0.2.1 uses cache schema 3. **Rebuild older caches, including 0.2.0 caches**, to regenerate neighbors with deterministic tie-breaking. Regenerate old Bismark-derived caches because their coordinates were previously interpreted incorrectly. Never reuse an old cache by copying or editing its metadata.

@@ -401,10 +401,12 @@ def _bars(pairs, percent=False) -> str:
 def run_demo(out: Path) -> int:
     import tempfile
 
-    rng = np.random.default_rng(0)
     n_sites, n_libs = 400, 12
     pos = np.arange(n_sites) * 100
-    z = rng.uniform(0.15, 0.85, size=n_libs)
+    # A known, recoverable signal: held-out lib0 differs substantially from
+    # the remaining panel. A random query near the panel mean cannot reliably
+    # beat that baseline at 2x coverage, even when the implementation is correct.
+    z = np.linspace(0.15, 0.85, n_libs)
     beta = np.tile(z[:, None], (1, n_sites))
     beta[:, :20] = 0.2
     counts = np.full((n_libs, n_sites), 80, dtype=np.int64)
