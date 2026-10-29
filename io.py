@@ -5,9 +5,11 @@ from __future__ import annotations
 import gzip
 from pathlib import Path
 
+from wgbs_impute.validation import validate_chrom
+
 import numpy as np
 
-FORMATS = ("bedmethyl", "bismark_cov", "cache_tsv", "counts")
+FORMATS = ("bedmethyl", "bismark_cov", "bismark_cov_zero", "cache_tsv", "counts")
 
 
 class ParseError(ValueError):
@@ -25,11 +27,13 @@ def open_text(path: Path):
 
 def sniff_format(path: Path, chrom: str | None) -> str:
     name = path.name.lower()
+    if name.endswith((".zero.cov", ".zero.cov.gz")):
+        return "bismark_cov_zero"
     if name.endswith(".cov") or ".cov." in name or name.endswith(".cov.gz"):
         return "bismark_cov"
     with open_text(path) as fh:
-        for line in fh:
-            if not line.strip() or line.startswith(("track", "#")):
+        for lineno, line in enumerate(fh, 1):
+            if not line.strip() or line.startswith(("track", "browser", "#")):
                 continue
             n = len(line.rstrip("\n").split("\t"))
             if n >= 11:
@@ -39,7 +43,7 @@ def sniff_format(path: Path, chrom: str | None) -> str:
             if n == 5:
                 return "counts"
             if n == 3:
-                return "cache_tsv" if chrom else "cache_tsv"
+                return "cache_tsv"
             raise ParseError(f"{path}: cannot detect format from {n} columns")
     raise ParseError(f"{path}: no data rows")
 
@@ -59,14 +63,17 @@ def read_sites(path: Path, fmt: str | None = None, chrom: str | None = None) -> 
     buckets: dict[str, dict[int, tuple[int, float, float]]] = {}
     n_dup = 0
     with open_text(path) as fh:
-        for line in fh:
-            if not line.strip() or line.startswith(("track", "#")):
+        for lineno, line in enumerate(fh, 1):
+            if not line.strip() or line.startswith(("track", "browser", "#")):
                 continue
             parts = line.rstrip("\n").split("\t")
-            parsed = _parse_row(parts, fmt, chrom, path)
-            if parsed is None:
-                continue
+            try:
+                parsed = _parse_row(parts, fmt, chrom, path)
+            except (ValueError, OverflowError) as exc:
+                raise ParseError(f"{path}:{lineno}: {exc}") from exc
             ch, start, end, meth, cov = parsed
+            if chrom and ch != chrom:
+                continue
             slot = buckets.setdefault(ch, {})
             prev = slot.get(start)
             if prev is None or cov > prev[2]:
@@ -87,70 +94,62 @@ def read_sites(path: Path, fmt: str | None = None, chrom: str | None = None) -> 
             e, m, c = slot[int(s)]
             end[i], meth[i], cov[i] = e, m, c
         out[ch] = {"start": starts, "end": end, "meth": meth, "cov": cov}
+    if not out and not chrom:
+        raise ParseError(f"{path}: no data rows")
     return out
 
 
 def _parse_row(parts: list[str], fmt: str, chrom: str | None, path: Path):
-    try:
-        if fmt == "bedmethyl":
-            if len(parts) < 11:
-                return None
+    if fmt == "bedmethyl":
+        if len(parts) < 11:
+            raise ParseError("bedMethyl requires at least 11 columns")
+        ch, start, end = parts[0], int(parts[1]), int(parts[2])
+        cov = float(parts[9])
+        meth = 0.0 if cov == 0 and parts[10] in {".", "NA", ""} else _meth_from_pct(float(parts[10]), cov)
+    elif fmt in {"bismark_cov", "bismark_cov_zero"}:
+        if len(parts) != 6:
+            raise ParseError("Bismark coverage requires 6 columns")
+        ch, start, end = parts[0], int(parts[1]) - (fmt == "bismark_cov"), int(parts[2])
+        _meth_from_pct(float(parts[3]), 1)
+        meth, unmeth = float(parts[4]), float(parts[5])
+        if not np.isfinite(unmeth) or unmeth < 0:
+            raise ParseError("unmethylated count must be finite and nonnegative")
+        cov = meth + unmeth
+    elif fmt == "cache_tsv":
+        if len(parts) != 3:
+            raise ParseError("cache_tsv requires 3 columns")
+        ch, start = chrom, int(parts[0])
+        cov = float(parts[1])
+        meth = _meth_from_pct(float(parts[2]), cov)
+        end = start + 1
+    elif fmt == "counts":
+        if len(parts) == 5:
             ch, start, end = parts[0], int(parts[1]), int(parts[2])
-            cov = float(parts[9])
-            pct = float(parts[10])
-            meth = _meth_from_pct(pct, cov)
-        elif fmt == "bismark_cov":
-            if len(parts) < 6:
-                return None
-            ch, start, end = parts[0], int(parts[1]), int(parts[2])
-            meth = float(parts[4])
-            unmeth = float(parts[5])
-            cov = meth + unmeth
-            meth = float(np.clip(meth, 0.0, cov))
-        elif fmt == "cache_tsv":
-            if len(parts) < 3:
-                return None
-            ch = chrom
-            start = int(parts[0])
-            cov = float(parts[1])
-            pct = float(parts[2])
+            meth, cov = float(parts[3]), float(parts[4])
+        elif len(parts) == 3 and chrom:
+            ch, start = chrom, int(parts[0])
             end = start + 1
-            meth = _meth_from_pct(pct, cov)
-        elif fmt == "counts":
-            if len(parts) >= 5 and not _is_int(parts[0]):
-                ch, start, end = parts[0], int(parts[1]), int(parts[2])
-                meth, cov = float(parts[3]), float(parts[4])
-            elif len(parts) >= 3 and chrom:
-                ch = chrom
-                start = int(parts[0])
-                end = start + 1
-                meth, cov = float(parts[1]), float(parts[2])
-            else:
-                raise ParseError(f"{path}: counts rows need a chromosome column or --chrom")
-            if cov < 0:
-                return None
-            meth = float(np.clip(meth, 0.0, cov))
+            meth, cov = float(parts[1]), float(parts[2])
         else:
-            return None
-    except ValueError:
-        return None
-    if cov < 0:
-        return None
+            raise ParseError("counts needs 5 columns, or 3 columns with --chrom")
+    else:
+        raise ParseError(f"unknown format {fmt}")
+    validate_chrom(ch)
+    if start < 0 or end <= start or end >= np.iinfo(np.int64).max:
+        raise ParseError("coordinates require 0 <= start < end")
+    if not np.isfinite(cov) or not np.isfinite(meth) or not 0 <= meth <= cov:
+        raise ParseError("counts require finite 0 <= methylated <= coverage")
+    if cov != int(cov) or meth != int(meth):
+        raise ParseError("read counts must be integers")
+    if cov > np.iinfo(np.uint32).max:
+        raise ParseError("coverage exceeds supported uint32 range")
     return ch, start, end, meth, cov
 
 
-def _is_int(text: str) -> bool:
-    try:
-        int(text)
-    except ValueError:
-        return False
-    return True
-
-
 def _meth_from_pct(pct: float, cov: float) -> float:
-    if cov <= 0:
-        return 0.0
-    return float(np.clip(np.round(pct / 100.0 * cov), 0.0, cov))
+    if not np.isfinite(pct) or not 0 <= pct <= 100:
+        raise ParseError("methylation percent must be finite and between 0 and 100")
+    return float(np.round(pct / 100.0 * cov))
 
 
 def mean_positive_cov(cov: np.ndarray) -> float:
@@ -159,7 +158,7 @@ def mean_positive_cov(cov: np.ndarray) -> float:
 
 
 def sample_id_from_filename(path: Path) -> str:
-    """`IHECRE00000155_B_Lymphocyte.chr21.bed.gz` -> `IHECRE00000155`."""
+    """Infer sample identity from the filename; explicit manifests can override it."""
     name = path.name
     if name.endswith(".gz"):
         name = name[:-3]
@@ -173,6 +172,7 @@ def sample_id_from_filename(path: Path) -> str:
 
 def chrom_from_filename(path: Path) -> str:
     import re
+
     match = re.search(r"\.(chr(?:[0-9]+|X|Y|M))\.", path.name, re.IGNORECASE)
     return match.group(1) if match else ""
 
@@ -180,8 +180,8 @@ def chrom_from_filename(path: Path) -> str:
 def iter_panel_files(panel_dir: Path, *, caches: bool = False) -> list[Path]:
     """Library files in one directory, not in subfolders.
 
-    Healthy panels are BED files. Disease folders in this project are also
-    `start cov pct` caches named `SAMPLE.chr21.tsv`, so those are included
+    Panels accept BED and Bismark coverage files. Three-column
+    `start cov pct` caches named `SAMPLE.chrN.tsv` are also included
     when `caches` is set. `samples.tsv` is a table, not a library.
     """
     panel_dir = Path(panel_dir)
@@ -192,7 +192,7 @@ def iter_panel_files(panel_dir: Path, *, caches: bool = False) -> list[Path]:
         name = path.name.lower()
         if name in {"samples.tsv", "manifest.tsv"}:
             continue
-        if name.endswith(".bed") or name.endswith(".bed.gz"):
+        if name.endswith((".bed", ".bed.gz", ".cov", ".cov.gz")):
             found.append(path)
         elif caches and (name.endswith(".tsv") or name.endswith(".tsv.gz")):
             found.append(path)
@@ -214,10 +214,12 @@ def read_disease_table(path: Path) -> dict[str, dict]:
         for row in reader:
             sid = (row.get(id_col) or "").strip()
             if not sid:
-                continue
+                raise ParseError(f"{path}:{reader.line_num}: missing sample identity")
+            if sid in out:
+                raise ParseError(f"{path}:{reader.line_num}: duplicate disease sample {sid}")
             out[sid] = {
                 "disease": (row.get("disease") or "").strip(),
-                "role": (row.get("role") or "").strip(),
+                "role": (row.get("role") or "ref").strip(),
             }
     return out
 
@@ -237,7 +239,8 @@ def write_manifest(
     """
     import csv
 
-    files = [(path, "") for path in iter_panel_files(panel_dir)]
+    same_dir = disease_dir is not None and Path(panel_dir).resolve() == Path(disease_dir).resolve()
+    files = [] if same_dir else [(path, "") for path in iter_panel_files(panel_dir)]
     labels = {}
     if disease_dir is not None:
         table = Path(disease_table) if disease_table else None
@@ -252,35 +255,42 @@ def write_manifest(
             sid = sample_id_from_filename(path)
             info = labels.get(sid, {})
             role = info.get("role", "")
-            if labels and role and disease_role != "all" and role != disease_role:
+            if table is not None and (sid not in labels or (disease_role != "all" and role != disease_role)):
                 continue
             files.append((path, info.get("disease") or Path(disease_dir).name))
     if not files:
         raise ParseError(f"{panel_dir}: no library files")
     output = Path(output)
     rows = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     for path, group in files:
         sid = sample_id_from_filename(path)
-        if sid in seen:
-            print(f"warning: {sid} already in the manifest, skipping {path.name}", flush=True)
-            continue
-        seen.add(sid)
+        key = (sid, chrom_from_filename(path))
+        if key in seen:
+            raise ParseError(
+                f"ambiguous sample/chromosome {key}: use an explicit manifest with unique identities"
+            )
+        seen.add(key)
         try:
             rel = path.resolve().relative_to(output.parent.resolve())
             stored = str(rel)
         except ValueError:
             stored = str(path.resolve())
-        rows.append({
-            "path": stored,
-            "sample_id": sid,
-            "group": group,
-            "chrom": chrom_from_filename(path),
-        })
+        rows.append(
+            {
+                "path": stored,
+                "sample_id": sid,
+                "group": group,
+                "chrom": chrom_from_filename(path),
+            }
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="") as fh:
         writer = csv.DictWriter(
-            fh, fieldnames=["path", "sample_id", "group", "chrom"], delimiter="\t", lineterminator="\n",
+            fh,
+            fieldnames=["path", "sample_id", "group", "chrom"],
+            delimiter="\t",
+            lineterminator="\n",
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -301,21 +311,26 @@ def read_manifest(path: Path) -> list[dict]:
             sid = (row.get("sample_id") or "").strip()
             rel = (row.get("path") or "").strip()
             if not sid or not rel:
-                continue
-            if sid in seen:
-                raise ParseError(f"duplicate sample_id {sid}")
-            seen.add(sid)
+                raise ParseError(f"{path}:{reader.line_num}: path and sample_id are required")
+            ch = (row.get("chrom") or "").strip() or None
+            if ch:
+                validate_chrom(ch)
+            key = (sid, ch)
+            if key in seen:
+                raise ParseError(f"duplicate sample_id/chromosome {key}")
+            seen.add(key)
             sample_path = Path(rel)
             if not sample_path.is_absolute():
-                candidate = path.parent / sample_path
-                sample_path = candidate if candidate.exists() else Path(rel)
-            rows.append({
-                "path": sample_path,
-                "sample_id": sid,
-                "chrom": (row.get("chrom") or "").strip() or None,
-                "group": (row.get("group") or "").strip(),
-                "mean_cov": float(row["mean_cov"]) if (row.get("mean_cov") or "").strip() else None,
-            })
+                sample_path = path.parent / sample_path
+            rows.append(
+                {
+                    "path": sample_path,
+                    "sample_id": sid,
+                    "chrom": ch,
+                    "group": (row.get("group") or "").strip(),
+                    "mean_cov": float(row["mean_cov"]) if (row.get("mean_cov") or "").strip() else None,
+                }
+            )
     if not rows:
         raise ParseError(f"{path}: manifest has no libraries")
     return rows

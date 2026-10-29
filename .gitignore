@@ -2,3 +2,12 @@
 .mpl/
 __pycache__/
 *.pyc
+.DS_Store
+.venv/
+build/
+dist/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+demo_out/
+panel_cache/

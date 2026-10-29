@@ -1,0 +1,4 @@
+include Dockerfile .dockerignore requirements.txt requirements-docker.lock
+include README.md RELEASE_NOTES.md PUBLISHING.md
+recursive-include tests *.py
+recursive-include .github/workflows *.yml

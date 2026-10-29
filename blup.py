@@ -8,7 +8,7 @@ MIN_OVERLAP = 15
 
 
 def blup_gates(n_take: int) -> tuple[int, int]:
-    """Same gates as run_panel_size_ablation.blup_gates."""
+    """Minimum reference counts for fitting and neighbor overlap."""
     if n_take < 10:
         min_ok = max(3, n_take // 2 + 1)
         min_ov = max(2, min(n_take - 1, n_take // 2 + 1))
@@ -17,7 +17,7 @@ def blup_gates(n_take: int) -> tuple[int, int]:
 
 
 def calibrate(pred, truth) -> float:
-    """Same weight as run_panel_size_ablation.calibrate. Returns κ in [1, 80]."""
+    """Estimate prior strength from held-out prediction error; returns κ in [1, 80]."""
     ok = np.isfinite(pred) & np.isfinite(truth)
     if ok.sum() < 50:
         return 8.0
@@ -42,12 +42,13 @@ def fuse(pred_pct, meth, cov, kappa: float) -> np.ndarray:
 def meanfill_shrunk_cov(columns: np.ndarray, shrink: float) -> tuple[np.ndarray, np.ndarray]:
     """Research covariance: missing entries are replaced by the column mean, then shrunk.
 
-    This is the estimator behind the published chromosome-21 scores. Columns with
+    Columns with
     no observations get mean 0.5. Diagonal variances are floored at 1e-4 before
     the shrink, and 1e-6 is added after it.
     """
     col_ok = np.isfinite(columns).any(axis=0)
-    mu = np.where(col_ok, np.nanmean(columns, axis=0), 0.5)
+    counts = np.isfinite(columns).sum(axis=0)
+    mu = np.divide(np.nansum(columns, axis=0), counts, out=np.full(columns.shape[1], 0.5), where=col_ok)
     mu = np.clip(np.where(np.isfinite(mu), mu, 0.5), 0.0, 1.0)
     filled = np.clip(np.where(np.isfinite(columns), columns, mu), 0.0, 1.0)
     n = filled.shape[0]
@@ -66,7 +67,7 @@ def znorm_rows(mat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     filled = np.where(obs, mat, 0.0)
     means = filled.sum(axis=1, keepdims=True) / np.maximum(counts, 1)
     centred = np.where(obs, mat - means, 0.0)
-    norms = np.sqrt((centred ** 2).sum(axis=1, keepdims=True))
+    norms = np.sqrt((centred**2).sum(axis=1, keepdims=True))
     z = np.zeros_like(centred)
     good = norms[:, 0] > 1e-8
     z[good] = centred[good] / norms[good]
@@ -122,8 +123,8 @@ def pairwise_shrunk_cov(columns: np.ndarray, shrink: float) -> tuple[np.ndarray,
     entries are not filled.
     """
     n, p = columns.shape
-    mu = np.nanmean(columns, axis=0)
-    mu = np.where(np.isfinite(mu), mu, 0.5)
+    count = np.isfinite(columns).sum(axis=0)
+    mu = np.divide(np.nansum(columns, axis=0), count, out=np.full(p, 0.5), where=count > 0)
     cov = np.zeros((p, p), dtype=np.float64)
     finite = np.isfinite(columns)
     for a in range(p):
@@ -151,6 +152,7 @@ def select_neighbors(
     window: int,
     k: int,
     min_overlap: int,
+    sites: np.ndarray | None = None,
 ) -> np.ndarray:
     """Top-k neighbors inside ±window by |pairwise Pearson|. Shape (n, k), -1 padded.
 
@@ -162,7 +164,7 @@ def select_neighbors(
     out = np.full((n, k), -1, dtype=np.int32)
     if n == 0 or k <= 0:
         return out
-    for i in range(n):
+    for i in range(n) if sites is None else sites:
         lo = int(np.searchsorted(pos, pos[i] - window, side="left"))
         hi = int(np.searchsorted(pos, pos[i] + window, side="right"))
         cand = np.arange(lo, hi, dtype=np.int32)
@@ -197,6 +199,25 @@ def _abs_corr(y: np.ndarray, x: np.ndarray, min_overlap: int) -> np.ndarray:
     return corr
 
 
+def panel_summary(beta):
+    """Row statistics without warnings for missing or singly observed rows."""
+    count = np.isfinite(beta).sum(axis=1)
+    mean = np.divide(np.nansum(beta, axis=1), count, out=np.full(len(beta), np.nan), where=count > 0)
+    scatter = np.nansum((beta - mean[:, None]) ** 2, axis=1)
+    variance = np.divide(scatter, count - 1, out=np.zeros(len(beta)), where=count > 1)
+    return {
+        "panel_mean": (100 * mean).astype(np.float32),
+        "panel_sd": (100 * np.sqrt(variance)).astype(np.float32),
+        "n_label": count.astype(np.int32),
+    }
+
+
+def factor_row(factors, j):
+    """Fit one site's covariance on demand instead of allocating n × k × k."""
+    beta, beta_x, neigh, shrink, min_ok, filled = factors["model"]
+    return site_factors(beta, neigh, shrink, min_ok, beta_x=beta_x, filled=filled, sites=np.array([j]))
+
+
 def site_factors(
     beta: np.ndarray,
     neighbors: np.ndarray,
@@ -204,43 +225,43 @@ def site_factors(
     min_ok: int,
     beta_x: np.ndarray | None = None,
     filled: bool = False,
+    sites: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Query-independent BLUP pieces. `beta` is (n_sites, n_refs), fraction or NaN.
 
     `filled=True` is the research covariance: neighbor columns come from `beta_x`
     (coverage at least 1) and missing entries are mean-filled.
     """
-    n, k = neighbors.shape
+    which = np.arange(len(beta)) if sites is None else np.asarray(sites)
+    n, k = len(which), neighbors.shape[1]
     mu = np.full(n, np.nan, dtype=np.float32)
     mu_n = np.zeros((n, k), dtype=np.float32)
     sin = np.zeros((n, k), dtype=np.float32)
     snn = np.zeros((n, k, k), dtype=np.float32)
     solvable = np.zeros(n, dtype=bool)
-    with np.errstate(all="ignore"):
-        panel_mean = np.nanmean(beta, axis=1) * 100.0
-        panel_sd = np.nanstd(beta, axis=1, ddof=1) * 100.0
-        n_label = np.sum(np.isfinite(beta), axis=1).astype(np.int16)
-    panel_mean = np.where(np.isfinite(panel_mean), panel_mean, np.nan).astype(np.float32)
-    panel_sd = np.where(np.isfinite(panel_sd), panel_sd, 0.0).astype(np.float32)
-    for i in range(n):
+    summary = panel_summary(beta[which])
+    panel_mean, panel_sd, n_label = (summary[k] for k in ("panel_mean", "panel_sd", "n_label"))
+    for t, i in enumerate(which):
         nb = neighbors[i]
         nb = nb[nb >= 0]
-        if len(nb) < 2 or int(n_label[i]) < min_ok:
+        if len(nb) < 2 or int(n_label[t]) < min_ok:
             continue
         xsrc = beta if beta_x is None else beta_x
-        cols = np.column_stack([
-            np.asarray(beta[i], dtype=np.float64),
-            np.asarray(xsrc[nb], dtype=np.float64).T,
-        ])
+        cols = np.column_stack(
+            [
+                np.asarray(beta[i], dtype=np.float64),
+                np.asarray(xsrc[nb], dtype=np.float64).T,
+            ]
+        )
         ok_y = np.isfinite(cols[:, 0])
         cov_fn = meanfill_shrunk_cov if filled else pairwise_shrunk_cov
         mu_v, cov = cov_fn(cols[ok_y], shrink)
         m = len(nb)
-        mu[i] = np.float32(mu_v[0])
-        mu_n[i, :m] = mu_v[1:]
-        sin[i, :m] = cov[0, 1:]
-        snn[i, :m, :m] = cov[1:, 1:]
-        solvable[i] = True
+        mu[t] = np.float32(mu_v[0])
+        mu_n[t, :m] = mu_v[1:]
+        sin[t, :m] = cov[0, 1:]
+        snn[t, :m, :m] = cov[1:, 1:]
+        solvable[t] = True
     return {
         "panel_mean": panel_mean,
         "panel_sd": panel_sd,
@@ -254,10 +275,18 @@ def site_factors(
 
 
 def predict_research(
-    y_refs, x_nb, query_beta, query_cov, eval_idx, neighbors, panel_mean,
-    shrink=0.25, min_ok=12, floor=0.05,
+    y_refs,
+    x_nb,
+    query_beta,
+    query_cov,
+    eval_idx,
+    neighbors,
+    panel_mean,
+    shrink=0.25,
+    min_ok=12,
+    floor=0.05,
 ) -> np.ndarray:
-    """Research BLUP. Same algebra as audit_opus.blup_predict_v."""
+    """Direct research BLUP implementation for comparison with cached factors."""
     out = np.full(len(eval_idx), np.nan)
     for s, i in enumerate(eval_idx):
         neigh = neighbors[s]
@@ -320,7 +349,7 @@ def context_one(
     n_obs = int(obs.sum())
     if n_obs < 2 or not np.isfinite(mu_i):
         if clip_query and np.isfinite(mu_i):
-            return 100.0 * float(np.clip(mu_i, 0.0, 1.0)), n_obs, True
+            return 100.0 * float(np.clip(mu_i, 0.0, 1.0)), n_obs, False
         return float(panel_mean), n_obs, False
     x = q_beta[obs].astype(np.float64)
     if clip_query:

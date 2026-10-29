@@ -18,7 +18,10 @@ def neighbor_mean(q_beta: np.ndarray, neigh: np.ndarray, panel_mean: float) -> t
 
 def predict_local(beta, neigh, q_beta, sites, *, iterations, depth, seed, min_ok) -> np.ndarray:
     """Per-site CatBoost. NaNs stay missing; they are not filled with the column mean."""
-    from catboost import CatBoostRegressor, Pool
+    try:
+        from catboost import CatBoostRegressor, Pool
+    except ImportError as exc:
+        raise ValueError("CatBoost is required for local/global; install wgbs-impute[ml]") from exc
 
     out = np.full(len(sites), np.nan)
     for t, i in enumerate(sites):
@@ -38,9 +41,16 @@ def predict_local(beta, neigh, q_beta, sites, *, iterations, depth, seed, min_ok
         x_ok = x_ok[:, keep]
         xp = np.asarray(q_beta[nb], dtype=np.float64)[keep][None, :]
         model = CatBoostRegressor(
-            loss_function="RMSE", iterations=iterations, learning_rate=0.08, depth=depth,
-            l2_leaf_reg=10.0, min_data_in_leaf=3, random_seed=seed + int(i),
-            thread_count=1, verbose=False, allow_writing_files=False,
+            loss_function="RMSE",
+            iterations=iterations,
+            learning_rate=0.08,
+            depth=depth,
+            l2_leaf_reg=10.0,
+            min_data_in_leaf=3,
+            random_seed=seed + int(i),
+            thread_count=1,
+            verbose=False,
+            allow_writing_files=False,
         )
         model.fit(Pool(x_ok, y[ok]))
         out[t] = float(np.clip(model.predict(xp)[0], 0.0, 1.0) * 100.0)
@@ -48,11 +58,25 @@ def predict_local(beta, neigh, q_beta, sites, *, iterations, depth, seed, min_ok
 
 
 def predict_global(
-    pos, meth, cov, beta10, q_meth, q_cov, sites, *, max_train, refnn_k, seed, threads,
+    pos,
+    meth,
+    cov,
+    beta10,
+    q_meth,
+    q_cov,
+    sites,
+    *,
+    max_train,
+    refnn_k,
+    seed,
+    threads,
     iterations: int = 500,
 ) -> np.ndarray:
     """One CatBoost across sites, trained on panel libraries only."""
-    from catboost import CatBoostRegressor, Pool
+    try:
+        from catboost import CatBoostRegressor, Pool
+    except ImportError as exc:
+        raise ValueError("CatBoost is required for local/global; install wgbs-impute[ml]") from exc
 
     n, n_ref = beta10.shape
     if n_ref < 3 or n < 30:
@@ -88,9 +112,15 @@ def predict_global(
     x_q = _fill(x_q[np.asarray(sites)], med)
     n_va = max(1, int(round(0.1 * len(y_tr))))
     model = CatBoostRegressor(
-        loss_function="RMSE", iterations=iterations, learning_rate=0.1, depth=6,
-        random_seed=seed, thread_count=threads, early_stopping_rounds=10,
-        verbose=False, allow_writing_files=False,
+        loss_function="RMSE",
+        iterations=iterations,
+        learning_rate=0.1,
+        depth=6,
+        random_seed=seed,
+        thread_count=threads,
+        early_stopping_rounds=10,
+        verbose=False,
+        allow_writing_files=False,
     )
     model.fit(Pool(x_tr[n_va:], y_tr[n_va:]), eval_set=Pool(x_tr[:n_va], y_tr[:n_va]), use_best_model=True)
     pred = np.clip(model.predict(x_q), 0.0, 1.0) * 100.0
@@ -115,7 +145,6 @@ def _fill(x, med):
 
 def _features(pos, meth, cov, ref_b, k):
     """17 columns plus refNN. Correlation uses the same sites on both sides."""
-    n = len(pos)
     y_nb = _beta_row(np.asarray(meth, dtype=np.float64), np.asarray(cov, dtype=np.float64))
     with np.errstate(all="ignore"):
         sample_avg = np.nanmean(ref_b, axis=1)
@@ -127,12 +156,27 @@ def _features(pos, meth, cov, ref_b, k):
     local_mean = local_mean.copy()
     local_mean[miss] = sample_avg[miss]
     local_sd = np.where(np.isfinite(local_sd), local_sd, 0.0)
-    x17 = np.column_stack([
-        sample_avg, up_b[0], dn_b[0], up_d[0], dn_d[0],
-        up_b[1], dn_b[1], up_d[1], dn_d[1],
-        local_mean, local_sd, np.log1p(np.asarray(cov, dtype=np.float64)),
-        pct[2], ref_sd, pct[3] - pct[1], pct[0], pct[4],
-    ])
+    x17 = np.column_stack(
+        [
+            sample_avg,
+            up_b[0],
+            dn_b[0],
+            up_d[0],
+            dn_d[0],
+            up_b[1],
+            dn_b[1],
+            up_d[1],
+            dn_d[1],
+            local_mean,
+            local_sd,
+            np.log1p(np.asarray(cov, dtype=np.float64)),
+            pct[2],
+            ref_sd,
+            pct[3] - pct[1],
+            pct[0],
+            pct[4],
+        ]
+    )
     nn = _refnn(y_nb, ref_b, k)
     complete = np.isfinite(x17[:, :5]).all(axis=1)
     return np.column_stack([x17, nn]), complete

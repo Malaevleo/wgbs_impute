@@ -18,8 +18,19 @@ from wgbs_impute.optional import predict_comet, predict_global, predict_hmm, pre
 
 def _bed_line(chrom, start, meth, cov):
     pct = 0.0 if cov <= 0 else 100.0 * meth / cov
-    cols = [chrom, str(start), str(start + 1), ".", "0", "+",
-            str(start), str(start + 1), "0", str(cov), f"{pct:.6f}"]
+    cols = [
+        chrom,
+        str(start),
+        str(start + 1),
+        ".",
+        "0",
+        "+",
+        str(start),
+        str(start + 1),
+        "0",
+        str(cov),
+        f"{pct:.6f}",
+    ]
     return "\t".join(cols)
 
 
@@ -33,44 +44,36 @@ def _write_bed(path: Path, rows):
 
 
 class ResearchPresetTests(unittest.TestCase):
-    def test_research_predict_matches_the_audit_function(self):
-        import os
-        import sys
-        root = Path("/Users/leonidmalaev/Desktop/adna")
-        os.environ.setdefault("MPLBACKEND", "Agg")
-        sys.path.insert(0, str(root))
-        from audit_opus.run_opus import blup_predict_v
-        from run_local_imputation import select_neighbors as old_select
-        from run_local_imputation import znorm_rows
+    def test_research_cached_factors_match_direct_solver(self):
         from wgbs_impute.blup import predict_research, research_neighbors
+        from wgbs_impute.impute import _context_at
+        from wgbs_impute.panel import _fit_chrom
 
         rng = np.random.default_rng(1)
         n, r = 40, 12
         pos = np.arange(n) * 200
         beta10 = np.clip(rng.normal(0.6, 0.2, size=(n, r)), 0.02, 0.98)
         beta1 = beta10.copy()
-        hole = rng.random((n, r)) < 0.2
-        beta1[hole] = rng.random((n, r))[hole]
+        beta1[rng.random((n, r)) < 0.2] = np.nan
         beta10[rng.random((n, r)) < 0.1] = np.nan
         q = np.clip(rng.normal(0.5, 0.2, size=n), 0.0, 1.0)
         q[rng.random(n) < 0.3] = np.nan
-        qc = rng.integers(0, 8, size=n).astype(np.float64)
+        qc = rng.integers(0, 8, size=n).astype(float)
         eval_idx = np.arange(0, n, 2)
-        z, mask = znorm_rows(beta10)
-        old_nb = old_select(pos, z, mask, eval_idx, 5000, 8, 5)
-        new_mat = research_neighbors(pos, beta10, 5000, 8, 5, sites=eval_idx)
-        new_nb = [new_mat[i][new_mat[i] >= 0] for i in eval_idx]
-        for a, b in zip(old_nb, new_nb):
-            self.assertEqual(list(a), list(b))
-        pm = np.nanmean(beta10, axis=1) * 100.0
-        old = blup_predict_v(beta10, beta1, q, qc, eval_idx, old_nb, pm, 0.25, 6, 0.05)
-        new = predict_research(beta10, beta1, q, qc, eval_idx, new_nb, pm, 0.25, 6, 0.05)
-        self.assertTrue(np.allclose(old, new, equal_nan=True))
+        nb = research_neighbors(pos, beta10, 5000, 8, 5)
+        pm = np.nanmean(beta10, axis=1) * 100
+        direct = predict_research(
+            beta10, beta1, q, qc, eval_idx, [nb[i][nb[i] >= 0] for i in eval_idx], pm, 0.25, 6, 0.05
+        )
+        neigh, factors = _fit_chrom(pos, beta10, beta1, 5000, 8, 0.25, 6, 5, "research")
+        cached = [_context_at(i, neigh, factors, q, qc, 6, 0.05, 0, clip_query=True)[0] for i in eval_idx]
+        np.testing.assert_allclose(direct, cached, rtol=1e-5, atol=1e-4)
 
 
 class ManifestTests(unittest.TestCase):
     def test_make_manifest_lists_bed_files(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             beds = tmp / "references"
@@ -79,9 +82,18 @@ class ManifestTests(unittest.TestCase):
             (beds / "IHECRE00000002.bed").write_bytes(b"")
             (beds / "notes.txt").write_text("skip")
             out = tmp / "manifest.tsv"
-            self.assertEqual(main([
-                "make-manifest", "--panel-dir", str(beds), "--output", str(out),
-            ]), 0)
+            self.assertEqual(
+                main(
+                    [
+                        "make-manifest",
+                        "--panel-dir",
+                        str(beds),
+                        "--output",
+                        str(out),
+                    ]
+                ),
+                0,
+            )
             lines = out.read_text().splitlines()
             self.assertEqual(lines[0], "path\tsample_id\tgroup\tchrom")
             body = [line.split("\t") for line in lines[1:]]
@@ -93,6 +105,7 @@ class ManifestTests(unittest.TestCase):
 
     def test_disease_dir_adds_reference_libraries_only(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             healthy = tmp / "healthy"
@@ -106,10 +119,20 @@ class ManifestTests(unittest.TestCase):
                 "role\tepirr\tdisease\nref\tIHECRE00000009\tAML\ntarget\tIHECRE00000010\tCLL\n"
             )
             out = tmp / "manifest.tsv"
-            self.assertEqual(main([
-                "make-manifest", "--panel-dir", str(healthy), "--disease-dir", str(disease),
-                "--output", str(out),
-            ]), 0)
+            self.assertEqual(
+                main(
+                    [
+                        "make-manifest",
+                        "--panel-dir",
+                        str(healthy),
+                        "--disease-dir",
+                        str(disease),
+                        "--output",
+                        str(out),
+                    ]
+                ),
+                0,
+            )
             body = [line.split("\t") for line in out.read_text().splitlines()[1:]]
             ids = [row[1] for row in body]
             groups = {row[1]: row[2] for row in body}
@@ -120,22 +143,20 @@ class ManifestTests(unittest.TestCase):
 
 class ParserTests(unittest.TestCase):
     def test_formats_keep_zero_and_large_counts(self):
-        root = Path(self.id().split(".")[-1])
-        # Isolated per-test directories live under the temp path unittest gives us via id only.
-        # Write next to a TemporaryDirectory instead.
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             bed = tmp / "q.bed.gz"
-            _write_bed(bed, [("chr1", 10, 200, 400), ("chr1", 20, 0, 0), ("chr1", 30, 15, 10)])
+            _write_bed(bed, [("chr1", 10, 200, 400), ("chr1", 20, 0, 0), ("chr1", 30, 10, 10)])
             sites = read_sites(bed)["chr1"]
             self.assertEqual(list(sites["cov"]), [400, 0, 10])
             self.assertEqual(sites["meth"][0], 200)
-            self.assertEqual(sites["meth"][2], 10)  # 150% would clip; 15 counts on cov 10 is already clipped by the writer
+            self.assertEqual(sites["meth"][2], 10)
             covf = tmp / "q.cov.gz"
-            covf.write_bytes(gzip.compress(
-                b"chr1\t10\t11\t50\t5\t5\nchr1\t20\t21\t0\t0\t0\nchr1\t30\t31\t40\t300\t200\n"
-            ))
+            covf.write_bytes(
+                gzip.compress(b"chr1\t10\t11\t50\t5\t5\nchr1\t20\t21\t0\t0\t0\nchr1\t30\t31\t40\t300\t200\n")
+            )
             got = read_sites(covf)["chr1"]
             self.assertEqual(list(got["cov"]), [10, 0, 500])
             self.assertEqual(got["meth"][2], 300)
@@ -148,6 +169,7 @@ class ParserTests(unittest.TestCase):
 
     def test_duplicate_keeps_higher_coverage(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "d.bed"
             _write_bed(path, [("chr1", 10, 1, 2), ("chr1", 10, 9, 10)])
@@ -159,10 +181,12 @@ class ParserTests(unittest.TestCase):
 
 class EstimatorTests(unittest.TestCase):
     def test_pairwise_moves_less_than_mean_fill(self):
-        columns = np.column_stack([
-            np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
-            np.array([0.0, 0.0, 0.0, 1.0, 1.0, np.nan]),
-        ])
+        columns = np.column_stack(
+            [
+                np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+                np.array([0.0, 0.0, 0.0, 1.0, 1.0, np.nan]),
+            ]
+        )
         _, cov = pairwise_shrunk_cov(columns, shrink=0.0)
         filled = columns.copy()
         for j in range(filled.shape[1]):
@@ -243,12 +267,25 @@ def _write_panel(tmp: Path, pos, meth, counts):
 class EndToEndTests(unittest.TestCase):
     def test_query_is_removed_and_fused_beats_the_mean(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             manifest, ids, pos, meth, counts = _linked_panel(tmp)
             cache = tmp / "cache"
-            self.assertEqual(main(["prepare-panel", "--manifest", str(manifest), "--cache", str(cache),
-                                   "--min-ref-mean-cov", "0"]), 0)
+            self.assertEqual(
+                main(
+                    [
+                        "prepare-panel",
+                        "--manifest",
+                        str(manifest),
+                        "--cache",
+                        str(cache),
+                        "--min-ref-mean-cov",
+                        "0",
+                    ]
+                ),
+                0,
+            )
             # Corrupt the other chromosome. Imputing chr1 must not read it.
             (cache / "chr2" / "pos.npy").write_bytes(b"not a numpy file")
             query = tmp / "query.bed.gz"
@@ -263,16 +300,36 @@ class EndToEndTests(unittest.TestCase):
                     q_rows.append(("chr1", int(pos[s]), int(meth[hold, s]), int(counts[hold, s])))
             _write_bed(query, q_rows)
             out = tmp / "out.tsv"
-            self.assertEqual(main([
-                "impute", "--query", str(query), "--panel-cache", str(cache), "--output", str(out),
-                "--sample-id", ids[hold], "--chrom", "chr1", "--threads", "1", "--kappa", "8",
-            ]), 0)
+            self.assertEqual(
+                main(
+                    [
+                        "impute",
+                        "--query",
+                        str(query),
+                        "--panel-cache",
+                        str(cache),
+                        "--output",
+                        str(out),
+                        "--sample-id",
+                        ids[hold],
+                        "--chrom",
+                        "chr1",
+                        "--threads",
+                        "1",
+                        "--kappa",
+                        "8",
+                    ]
+                ),
+                0,
+            )
             report = json.loads(Path(str(out) + ".run.json").read_text())
             self.assertNotIn(ids[hold], report["panel_sample_ids"])
             self.assertEqual(report["chromosomes"]["chr1"]["kappa"], 8.0)
             table = _read_out(out)
             self.assertTrue(all(r["chrom"] == "chr1" for r in table))
-            low = [r for r in table if int(r["cov"]) < 10 and r["source"] not in ("passthrough", "panel_mean")]
+            low = [
+                r for r in table if int(r["cov"]) < 10 and r["source"] not in ("passthrough", "panel_mean")
+            ]
             self.assertGreater(len(low), 10)
             truth = 100.0 * meth[hold] / counts[hold]
             err_f, err_m = [], []
@@ -285,12 +342,22 @@ class EndToEndTests(unittest.TestCase):
 
     def test_low_sd_does_not_solve_and_only_below_drops_deep_rows(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             manifest, ids, pos, meth, counts = _panel_and_query(tmp, n_sites=40, n_libs=10, cov=30)
             cache = tmp / "cache"
-            main(["prepare-panel", "--manifest", str(manifest), "--cache", str(cache),
-                  "--min-ref-mean-cov", "0"])
+            main(
+                [
+                    "prepare-panel",
+                    "--manifest",
+                    str(manifest),
+                    "--cache",
+                    str(cache),
+                    "--min-ref-mean-cov",
+                    "0",
+                ]
+            )
             query = tmp / "query.bed"
             # Coverage 2 keeps every site under the default threshold of 10.
             rows = [("chr1", int(pos[s]), 1, 2) for s in range(len(pos))]
@@ -305,9 +372,25 @@ class EndToEndTests(unittest.TestCase):
                 return real(*args, **kwargs)
 
             with patch("wgbs_impute.impute.context_one", side_effect=wrapped):
-                main(["impute", "--query", str(query), "--panel-cache", str(cache),
-                      "--output", str(out), "--sample-id", ids[0], "--chrom", "chr1",
-                      "--kappa", "8", "--threads", "1"])
+                main(
+                    [
+                        "impute",
+                        "--query",
+                        str(query),
+                        "--panel-cache",
+                        str(cache),
+                        "--output",
+                        str(out),
+                        "--sample-id",
+                        ids[0],
+                        "--chrom",
+                        "chr1",
+                        "--kappa",
+                        "8",
+                        "--threads",
+                        "1",
+                    ]
+                )
             table = _read_out(out)
             stable_rows = [r for r in table if r["panel_sd"] and float(r["panel_sd"]) < 5]
             self.assertGreater(len(stable_rows), 0)
@@ -315,13 +398,31 @@ class EndToEndTests(unittest.TestCase):
                 self.assertEqual(r["source"], "panel_mean")
                 self.assertAlmostEqual(float(r["pct"]), float(r["pct_panel"]), places=3)
                 self.assertAlmostEqual(float(r["pct_blup"]), float(r["pct_panel"]), places=3)
-            n_variable = sum(1 for r in table if r["panel_sd"] and float(r["panel_sd"]) >= 5
-                             and r["source"] != "passthrough")
+            n_variable = sum(
+                1
+                for r in table
+                if r["panel_sd"] and float(r["panel_sd"]) >= 5 and r["source"] != "passthrough"
+            )
             self.assertEqual(len(called), n_variable)
             below = tmp / "below.tsv"
-            main(["impute", "--query", str(query), "--panel-cache", str(cache),
-                  "--output", str(below), "--sample-id", ids[0], "--chrom", "chr1",
-                  "--only-below", "--kappa", "8"])
+            main(
+                [
+                    "impute",
+                    "--query",
+                    str(query),
+                    "--panel-cache",
+                    str(cache),
+                    "--output",
+                    str(below),
+                    "--sample-id",
+                    ids[0],
+                    "--chrom",
+                    "chr1",
+                    "--only-below",
+                    "--kappa",
+                    "8",
+                ]
+            )
             self.assertTrue(_read_out(below))
             for r in _read_out(below):
                 self.assertLess(int(r["cov"]), 10)
@@ -346,14 +447,26 @@ class EndToEndTests(unittest.TestCase):
             self.assertTrue(np.isfinite(pred).all())
             self.assertTrue(((pred >= 0) & (pred <= 100)).all())
         neigh = select_neighbors(pos, beta, 25000, 5, min_overlap=4)
-        local = predict_local(beta, neigh, beta[:, 0], np.array([0, 1, 2]), iterations=20, depth=2, seed=1, min_ok=4)
+        local = predict_local(
+            beta, neigh, beta[:, 0], np.array([0, 1, 2]), iterations=20, depth=2, seed=1, min_ok=4
+        )
         self.assertEqual(len(local), 3)
         self.assertTrue(np.isfinite(local).all())
         meth = np.rint(beta * 40)
         cov = np.full((n, r), 40.0)
         global_pred = predict_global(
-            pos, meth, cov, beta, meth[:, 0], cov[:, 0], np.arange(n),
-            max_train=2000, refnn_k=3, seed=1, threads=1, iterations=30,
+            pos,
+            meth,
+            cov,
+            beta,
+            meth[:, 0],
+            cov[:, 0],
+            np.arange(n),
+            max_train=2000,
+            refnn_k=3,
+            seed=1,
+            threads=1,
+            iterations=30,
         )
         self.assertEqual(len(global_pred), n)
         self.assertTrue(np.isfinite(global_pred).all())

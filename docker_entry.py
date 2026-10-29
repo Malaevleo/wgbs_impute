@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import html
+import sys
+from array import array
+from collections import Counter
 import gzip
 import json
 from pathlib import Path
@@ -10,14 +15,19 @@ from pathlib import Path
 import numpy as np
 
 from wgbs_impute.cli import main as tool_main
+from wgbs_impute import __version__
 from wgbs_impute.io import sample_id_from_filename
+from wgbs_impute.impute import parse_kappa_arg
+from wgbs_impute.thinning import subsample_depths
+from wgbs_impute.validation import validate_options
 
 COVERAGE_BINS = ("0", "1", "2-4", "5-9", "10+")
 SD_BINS = ("0-5", "5-10", "10-15", "15+")
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="wgbs-impute")
+    parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--refs", type=Path, default=Path("/refs"))
     parser.add_argument("--query", type=Path, default=Path("/query/query.bed.gz"))
@@ -25,11 +35,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--preset", choices=("research", "pairwise"), default="research")
     parser.add_argument("--max-cov", type=float, default=10.0)
     parser.add_argument("--only-below", action="store_true")
+    parser.add_argument("--include-panel-sites", action="store_true")
     parser.add_argument("--chrom", default=None)
     parser.add_argument("--n-refs", type=int, default=0)
     parser.add_argument("--disease-role", default="ref", choices=("ref", "target", "all"))
     parser.add_argument("--method", default="blup")
+    parser.add_argument(
+        "--sample-id", help="reference sample identity to exclude; inferred from query name by default"
+    )
+    parser.add_argument(
+        "--format",
+        default="auto",
+        choices=("auto", "bedmethyl", "bismark_cov", "bismark_cov_zero", "cache_tsv", "counts"),
+    )
+    parser.add_argument("--window", type=int, default=25000)
+    parser.add_argument("--neighbors", type=int, default=30)
+    parser.add_argument("--shrink", type=float, default=0.25)
+    parser.add_argument("--noise-floor", type=float, default=0.05)
+    parser.add_argument("--sd-passthrough", type=float)
+    parser.add_argument("--neighbor-min-cov", type=int, default=1)
+    parser.add_argument("--min-ref-mean-cov", type=float, default=10)
+    parser.add_argument("--min-ref-site-cov", type=int, default=10)
+    parser.add_argument("--kappa")
+    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-fuse", action="store_true")
     args = parser.parse_args(argv)
+    validate_options(**{k: v for k, v in vars(args).items() if v is not None})
     if args.demo:
         return run_demo(args.out)
     if not args.refs.is_dir():
@@ -37,52 +69,149 @@ def main(argv: list[str] | None = None) -> int:
     if not args.query.is_file():
         raise SystemExit(f"query file not found: {args.query}")
     run_pipeline(
-        args.refs, args.query, args.out,
-        preset=args.preset, max_cov=args.max_cov, only_below=args.only_below,
-        chrom=args.chrom, n_refs=args.n_refs, disease_role=args.disease_role,
+        args.refs,
+        args.query,
+        args.out,
+        preset=args.preset,
+        max_cov=args.max_cov,
+        only_below=args.only_below,
+        chrom=args.chrom,
+        n_refs=args.n_refs,
+        disease_role=args.disease_role,
         method=args.method,
+        sample_id=args.sample_id,
+        fmt=args.format,
+        options={
+            k: getattr(args, k)
+            for k in (
+                "window",
+                "neighbors",
+                "shrink",
+                "noise_floor",
+                "sd_passthrough",
+                "neighbor_min_cov",
+                "min_ref_mean_cov",
+                "min_ref_site_cov",
+                "kappa",
+                "threads",
+                "seed",
+                "no_fuse",
+                "include_panel_sites",
+            )
+        },
     )
     return 0
 
 
 def run_pipeline(
-    refs: Path, query: Path, out: Path, *,
-    preset: str, max_cov: float, only_below: bool, chrom: str | None,
-    n_refs: int, disease_role: str, method: str,
+    refs: Path,
+    query: Path,
+    out: Path,
+    *,
+    preset: str,
+    max_cov: float,
+    only_below: bool,
+    chrom: str | None,
+    n_refs: int,
+    disease_role: str,
+    method: str,
+    sample_id: str | None = None,
+    fmt: str = "auto",
+    options: dict | None = None,
 ) -> None:
+    options = options or {}
+    validate_options(**{k: v for k, v in options.items() if v is not None})
+    if options.get("kappa") is not None:
+        parse_kappa_arg(options["kappa"])
     out.mkdir(parents=True, exist_ok=True)
+    if any(out.iterdir()):
+        raise ValueError(f"output directory must be empty: {out}; choose a new directory")
     manifest = out / "manifest.tsv"
-    make = ["make-manifest", "--panel-dir", str(refs), "--output", str(manifest),
-            "--disease-role", disease_role]
+    make = [
+        "make-manifest",
+        "--panel-dir",
+        str(refs),
+        "--output",
+        str(manifest),
+        "--disease-role",
+        disease_role,
+    ]
     if (refs / "samples.tsv").exists():
         make.extend(["--disease-dir", str(refs)])
     if tool_main(make) != 0:
         raise SystemExit("make-manifest failed")
     cache = out / "panel_cache"
-    if tool_main(["prepare-panel", "--manifest", str(manifest), "--cache", str(cache),
-                  "--preset", preset]) != 0:
+    shared = []
+    for key in (
+        "window",
+        "neighbors",
+        "shrink",
+        "sd_passthrough",
+        "min_ref_mean_cov",
+        "min_ref_site_cov",
+        "seed",
+    ):
+        if options.get(key) is not None:
+            shared.extend(["--" + key.replace("_", "-"), str(options[key])])
+    if (
+        tool_main(
+            ["prepare-panel", "--manifest", str(manifest), "--cache", str(cache), "--preset", preset, *shared]
+        )
+        != 0
+    ):
         raise SystemExit("prepare-panel failed")
-    impute = ["impute", "--query", str(query), "--panel-cache", str(cache),
-              "--output", str(out / "imputed.tsv"), "--preset", preset,
-              "--max-cov", str(max_cov), "--n-refs", str(n_refs), "--method", method]
+    impute = [
+        "impute",
+        "--query",
+        str(query),
+        "--panel-cache",
+        str(cache),
+        "--output",
+        str(out / "imputed.tsv"),
+        "--preset",
+        preset,
+        "--max-cov",
+        str(max_cov),
+        "--n-refs",
+        str(n_refs),
+        "--method",
+        method,
+    ]
+    impute.extend(shared)
+    impute.extend(["--format", fmt])
+    for key in ("noise_floor", "neighbor_min_cov", "kappa", "threads"):
+        if options.get(key) is not None:
+            impute.extend(["--" + key.replace("_", "-"), str(options[key])])
+    if options.get("no_fuse"):
+        impute.append("--no-fuse")
+    if options.get("include_panel_sites"):
+        impute.append("--include-panel-sites")
     if only_below:
         impute.append("--only-below")
     if chrom:
         impute.extend(["--chrom", chrom])
-    sid = sample_id_from_filename(query)
+    sid = sample_id if sample_id is not None else sample_id_from_filename(query)
     ids = _manifest_ids(manifest)
-    if sid in ids:
+    if sid in ids or sample_id is not None:
         impute.extend(["--sample-id", sid])
     if tool_main(impute) != 0:
         raise SystemExit("impute failed")
-    rows = _read_tsv(out / "imputed.tsv")
+    result_path = out / "imputed.tsv"
     report = json.loads((out / "imputed.tsv.run.json").read_text())
-    write_bed(out / "imputed.bed.gz", rows, preset, report)
-    stats, by_cov, by_sd = summarize(rows, report, max_cov)
+    write_bed(out / "imputed.bed.gz", _read_tsv(result_path), preset, report)
+    with result_path.open() as source, (out / "missing_predictions.tsv").open("w", newline="") as dest:
+        reader = csv.DictReader(source, delimiter="\t")
+        writer = csv.DictWriter(dest, fieldnames=reader.fieldnames, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        for row in reader:
+            if not row.get("pct"):
+                writer.writerow(row)
+    stats, by_cov, by_sd = summarize(_read_tsv(result_path), report, max_cov)
     _write_tsv(out / "stats.tsv", stats)
     _write_tsv(out / "stats_by_coverage.tsv", by_cov)
     _write_tsv(out / "stats_by_sd.tsv", by_sd)
     (out / "dashboard.html").write_text(render_dashboard(stats, by_cov, by_sd, preset))
+    (out / "run.complete.json").write_text(json.dumps({"version": report["version"], "status": "complete"}))
 
 
 def write_bed(path: Path, rows: list[dict], preset: str, report: dict) -> None:
@@ -91,122 +220,139 @@ def write_bed(path: Path, rows: list[dict], preset: str, report: dict) -> None:
         if "kappa" in info:
             kappas.append(f"{chrom}={float(info['kappa']):.4f}")
     header = f"# wgbs_impute preset={preset} kappa={','.join(kappas)}\n"
-    lines = [header]
-    for row in rows:
-        pct = row.get("pct") or row.get("pct_obs") or "0"
-        lines.append(
-            f"{row['chrom']}\t{row['start']}\t{row['end']}\t.\t0\t.\t"
-            f"{row['start']}\t{row['end']}\t0,0,0\t{row['cov']}\t{pct}\n"
-        )
     with gzip.open(path, "wt") as fh:
-        fh.writelines(lines)
+        fh.write(header)
+        for row in rows:
+            pct = row.get("pct")
+            if pct is None or pct == "":
+                continue
+            fh.write(
+                f"{row['chrom']}\t{row['start']}\t{row['end']}\t.\t0\t.\t"
+                f"{row['start']}\t{row['end']}\t0,0,0\t{row['cov']}\t{pct}\n"
+            )
 
 
-def summarize(rows: list[dict], report: dict, max_cov: float):
-    chroms = []
-    for chrom in _ordered(rows):
-        chroms.append(chrom)
-    stats = [_chrom_stats(rows, chrom, report, max_cov) for chrom in chroms]
-    stats.append(_chrom_stats(rows, "all", report, max_cov))
-    by_cov = []
-    by_sd = []
-    for chrom in chroms + ["all"]:
-        subset = rows if chrom == "all" else [r for r in rows if r["chrom"] == chrom]
-        for name in COVERAGE_BINS:
-            by_cov.append(_coverage_row(chrom, name, subset))
-        for name in SD_BINS:
-            by_sd.append(_sd_row(chrom, name, subset))
+class _Accumulator:
+    def __init__(self):
+        self.n = 0
+        self.sources = Counter()
+        self.sums = Counter()
+        self.counts = Counter()
+        self.sd = array("d")
+        self.coverage = {name: Counter() for name in COVERAGE_BINS}
+        self.sd_bins = {name: Counter() for name in SD_BINS}
+
+    def add(self, row, max_cov):
+        self.n += 1
+        self.sources[row["source"]] += 1
+        cov = float(row["cov"])
+        pct = float(row["pct"]) if row.get("pct") else float("nan")
+        obs = float(row["pct_obs"]) if row.get("pct_obs") else float("nan")
+        sd = float(row["panel_sd"]) if row.get("panel_sd") else float("nan")
+        self.counts["zero"] += cov == 0
+        self.counts["low"] += cov < max_cov
+        self.counts["missing"] += not np.isfinite(pct)
+        for name, value in (("cov", cov if cov > 0 else float("nan")), ("pct", pct), ("obs", obs)):
+            if np.isfinite(value):
+                self.sums[name] += value
+                self.counts[name] += 1
+        diff = abs(pct - obs)
+        if 1 <= cov < max_cov and np.isfinite(diff):
+            self.sums["diff"] += diff
+            self.counts["diff"] += 1
+        name = "0" if cov == 0 else "1" if cov == 1 else "2-4" if cov < 5 else "5-9" if cov < 10 else "10+"
+        bucket = self.coverage[name]
+        bucket["n"] += 1
+        if np.isfinite(pct):
+            bucket["pct"] += pct
+            bucket["n_pct"] += 1
+        if cov >= 1 and np.isfinite(diff):
+            bucket["diff"] += diff
+            bucket["n_diff"] += 1
+        if np.isfinite(sd):
+            self.sd.append(sd)
+            name = "0-5" if sd < 5 else "5-10" if sd < 10 else "10-15" if sd < 15 else "15+"
+            self.sd_bins[name]["n"] += 1
+            self.sd_bins[name]["mean"] += row["source"] == "panel_mean"
+
+    def stats(self, chrom, report):
+        info = report.get("chromosomes", {}).get(chrom, {})
+        if chrom == "all":
+            infos = list(report.get("chromosomes", {}).values())
+            kappa = float(np.mean([i["kappa"] for i in infos])) if infos else float("nan")
+            solved = sum(i.get("n_solved", 0) for i in infos)
+            refs = len(report.get("panel_sample_ids", []))
+        else:
+            kappa, solved, refs = (
+                info.get("kappa", float("nan")),
+                info.get("n_solved", 0),
+                info.get("n_libraries", 0),
+            )
+        return {
+            "chrom": chrom,
+            "n_sites": self.n,
+            "n_imputed": self.sources["blup"] + self.sources["blup_fused"],
+            "n_observed": self.sources["observed"],
+            "n_panel_mean": self.sources["panel_mean"],
+            "n_passthrough": self.sources["passthrough"],
+            "n_missing_predictions": self.counts["missing"],
+            "n_solved": solved,
+            "n_refs": refs,
+            "kappa": _num(kappa),
+            "query_mean_cov": _ratio(self.sums["cov"], self.counts["cov"]),
+            "frac_cov0": _ratio(self.counts["zero"], self.n),
+            "frac_cov_below_max": _ratio(self.counts["low"], self.n),
+            "mean_pct_imputed": _ratio(self.sums["pct"], self.counts["pct"]),
+            "mean_pct_observed": _ratio(self.sums["obs"], self.counts["obs"]),
+            "mean_abs_imputed_minus_observed": _ratio(self.sums["diff"], self.counts["diff"]),
+            "median_panel_sd": _num(float(np.median(self.sd)) if self.sd else float("nan")),
+        }
+
+
+def _ratio(total, count):
+    return _num(total / count) if count else ""
+
+
+def summarize(rows, report: dict, max_cov: float):
+    """Stream rows; retain only panel SDs for an exact median (8 bytes/site/group)."""
+    overall = _Accumulator()
+    groups = {}
+    for row in rows:
+        if row["chrom"] not in groups:
+            groups[row["chrom"]] = _Accumulator()
+        groups[row["chrom"]].add(row, max_cov)
+        overall.add(row, max_cov)
+    named = list(groups.items()) + [("all", overall)]
+    stats = [group.stats(chrom, report) for chrom, group in named]
+    by_cov, by_sd = [], []
+    for chrom, group in named:
+        for name, values in group.coverage.items():
+            by_cov.append(
+                {
+                    "chrom": chrom,
+                    "bin": name,
+                    "n_sites": values["n"],
+                    "mean_pct_imputed": _ratio(values["pct"], values["n_pct"]),
+                    "mean_abs_imputed_minus_observed": _ratio(values["diff"], values["n_diff"]),
+                }
+            )
+        for name, values in group.sd_bins.items():
+            by_sd.append(
+                {
+                    "chrom": chrom,
+                    "bin": name,
+                    "n_sites": values["n"],
+                    "frac_panel_mean": _ratio(values["mean"], values["n"]),
+                }
+            )
     return stats, by_cov, by_sd
-
-
-def _chrom_stats(rows, chrom, report, max_cov):
-    subset = rows if chrom == "all" else [r for r in rows if r["chrom"] == chrom]
-    cov = np.array([float(r["cov"]) for r in subset], dtype=np.float64)
-    pct = _nums(subset, "pct")
-    obs = _nums(subset, "pct_obs")
-    sd = _nums(subset, "panel_sd")
-    sources = [r["source"] for r in subset]
-    info = report.get("chromosomes", {}).get(chrom, {})
-    if chrom == "all":
-        infos = list(report.get("chromosomes", {}).values())
-        kappa = float(np.mean([i["kappa"] for i in infos])) if infos else float("nan")
-        n_solved = int(sum(i.get("n_solved", 0) for i in infos))
-        n_refs = int(infos[0]["n_libraries"]) if infos else 0
-    else:
-        kappa = float(info.get("kappa", float("nan")))
-        n_solved = int(info.get("n_solved", sources.count("blup") + sources.count("blup_fused")))
-        n_refs = int(info.get("n_libraries", 0))
-    positive = cov > 0
-    low = (cov >= 1) & (cov < max_cov)
-    return {
-        "chrom": chrom,
-        "n_sites": len(subset),
-        "n_imputed": sources.count("blup") + sources.count("blup_fused"),
-        "n_observed": sources.count("observed"),
-        "n_panel_mean": sources.count("panel_mean"),
-        "n_passthrough": sources.count("passthrough"),
-        "n_solved": n_solved,
-        "n_refs": n_refs,
-        "kappa": _num(kappa),
-        "query_mean_cov": _num(float(cov[positive].mean()) if positive.any() else float("nan")),
-        "frac_cov0": _num(float((cov == 0).mean()) if len(cov) else float("nan")),
-        "frac_cov_below_max": _num(float((cov < max_cov).mean()) if len(cov) else float("nan")),
-        "mean_pct_imputed": _num(_nanmean(pct)),
-        "mean_pct_observed": _num(_nanmean(obs)),
-        "mean_abs_imputed_minus_observed": _num(_absdiff(pct, obs, low)),
-        "median_panel_sd": _num(float(np.nanmedian(sd)) if np.isfinite(sd).any() else float("nan")),
-    }
-
-
-def _coverage_row(chrom, name, rows):
-    cov = np.array([float(r["cov"]) for r in rows]) if rows else np.array([])
-    mask = _cov_mask(cov, name)
-    pct = _nums(rows, "pct")
-    obs = _nums(rows, "pct_obs")
-    have_obs = mask & np.isfinite(obs) & (cov >= 1)
-    return {
-        "chrom": chrom,
-        "bin": name,
-        "n_sites": int(mask.sum()),
-        "mean_pct_imputed": _num(_nanmean(pct[mask]) if mask.any() else float("nan")),
-        "mean_abs_imputed_minus_observed": _num(_absdiff(pct, obs, have_obs)),
-    }
-
-
-def _sd_row(chrom, name, rows):
-    sd = _nums(rows, "panel_sd")
-    mask = _sd_mask(sd, name)
-    sources = np.array([r["source"] for r in rows]) if rows else np.array([])
-    n = int(mask.sum())
-    frac = float((sources[mask] == "panel_mean").mean()) if n else float("nan")
-    return {"chrom": chrom, "bin": name, "n_sites": n, "frac_panel_mean": _num(frac)}
-
-
-def _cov_mask(cov, name):
-    if name == "0":
-        return cov == 0
-    if name == "1":
-        return cov == 1
-    if name == "2-4":
-        return (cov >= 2) & (cov <= 4)
-    if name == "5-9":
-        return (cov >= 5) & (cov <= 9)
-    return cov >= 10
-
-
-def _sd_mask(sd, name):
-    if name == "0-5":
-        return np.isfinite(sd) & (sd < 5)
-    if name == "5-10":
-        return (sd >= 5) & (sd < 10)
-    if name == "10-15":
-        return (sd >= 10) & (sd < 15)
-    return sd >= 15
 
 
 def render_dashboard(stats, by_cov, by_sd, preset: str) -> str:
     overall = next(row for row in stats if row["chrom"] == "all")
-    kappas = ", ".join(f"{row['chrom']} {row['kappa']}" for row in stats if row["chrom"] != "all")
+    kappas = ", ".join(
+        f"{html.escape(str(row['chrom']))} {row['kappa']}" for row in stats if row["chrom"] != "all"
+    )
     sources = [
         ("observed", overall["n_observed"]),
         ("imputed", overall["n_imputed"]),
@@ -225,28 +371,28 @@ h1 {{ font-size: 22px; }} h2 {{ font-size: 16px; margin-top: 28px; }}
 .note {{ color: #595f74; }}
 </style></head><body>
 <h1>wgbs_impute</h1>
-<p class="note">Preset {preset}. References {overall['n_refs']}. κ {kappas}.</p>
-<p>Sites written {overall['n_sites']}. Solved {overall['n_solved']}.
-Panel mean {overall['n_panel_mean']}.</p>
+<p class="note">Preset {preset}. References {overall["n_refs"]}. κ {kappas}.</p>
+<p>Sites written {overall["n_sites"]}. Solved {overall["n_solved"]}.
+Panel mean {overall["n_panel_mean"]}.</p>
 <h2>Source</h2>
 {_bars(sources)}
 <h2>Imputed minus observed, by query coverage</h2>
-{_bars([(r['bin'], _f(r['mean_abs_imputed_minus_observed'])) for r in cov_rows])}
+{_bars([(r["bin"], _f(r["mean_abs_imputed_minus_observed"])) for r in cov_rows])}
 <h2>Fraction left on the panel mean, by panel SD</h2>
-{_bars([(r['bin'], _f(r['frac_panel_mean']) * 100) for r in sd_rows], percent=True)}
+{_bars([(r["bin"], _f(r["frac_panel_mean"]) * 100) for r in sd_rows], percent=True)}
 </body></html>
 """
 
 
 def _bars(pairs, percent=False) -> str:
     vals = [float(v) for _, v in pairs]
-    top = max(vals) if vals and max(vals) > 0 else 1.0
+    top = 100.0 if percent else max(vals) if vals and max(vals) > 0 else 1.0
     lines = []
     for label, value in pairs:
         width = 100.0 * float(value) / top
         suffix = f"{float(value):.1f}%" if percent else f"{float(value):.2f}"
         lines.append(
-            f'<div class="row"><span>{label}</span>'
+            f'<div class="row"><span>{html.escape(str(label))}</span>'
             f'<div class="bar" style="width:{width:.1f}%"></div><span>{suffix}</span></div>'
         )
     return "\n".join(lines)
@@ -254,6 +400,7 @@ def _bars(pairs, percent=False) -> str:
 
 def run_demo(out: Path) -> int:
     import tempfile
+
     rng = np.random.default_rng(0)
     n_sites, n_libs = 400, 12
     pos = np.arange(n_sites) * 100
@@ -276,8 +423,18 @@ def run_demo(out: Path) -> int:
         q_m[0::2] = 0
         query = tmp / "lib0.bed.gz"
         _write_bed(query, "chr1", pos, q_m, q_c)
-        run_pipeline(refs, query, out, preset="research", max_cov=10, only_below=False,
-                     chrom=None, n_refs=0, disease_role="ref", method="blup")
+        run_pipeline(
+            refs,
+            query,
+            out,
+            preset="research",
+            max_cov=10,
+            only_below=False,
+            chrom=None,
+            n_refs=0,
+            disease_role="ref",
+            method="blup",
+        )
         table = {int(r["start"]): r for r in _read_tsv(out / "imputed.tsv")}
         err_f, err_p = [], []
         truth = 100.0 * meth[0] / counts[0]
@@ -299,16 +456,7 @@ def run_demo(out: Path) -> int:
 
 
 def _thin_hypergeometric(meth, cov, depth, mean_full, seed):
-    rng_cov = np.random.default_rng(seed)
-    rng_meth = np.random.default_rng(seed + 555)
-    c = np.asarray(cov, dtype=np.int64)
-    m = np.minimum(np.asarray(meth, dtype=np.int64), c)
-    keep = min(1.0, depth / max(float(mean_full), 1e-9))
-    new_c = rng_cov.binomial(c, keep)
-    new_m = np.zeros_like(new_c)
-    ok = new_c > 0
-    new_m[ok] = rng_meth.hypergeometric(m[ok], (c - m)[ok], new_c[ok])
-    return new_m, new_c
+    return subsample_depths(meth, cov, [depth], mean_full, seed)[depth]
 
 
 def _write_bed(path: Path, chrom, pos, meth, cov) -> None:
@@ -316,57 +464,27 @@ def _write_bed(path: Path, chrom, pos, meth, cov) -> None:
     for s, m, c in zip(pos, meth, cov):
         pct = 0.0 if c <= 0 else 100.0 * float(m) / float(c)
         start, end = int(s), int(s) + 1
-        lines.append(
-            f"{chrom}\t{start}\t{end}\t.\t0\t.\t{start}\t{end}\t0,0,0\t{int(c)}\t{pct:.4f}\n"
-        )
+        lines.append(f"{chrom}\t{start}\t{end}\t.\t0\t.\t{start}\t{end}\t0,0,0\t{int(c)}\t{pct:.4f}\n")
     with gzip.open(path, "wt") as fh:
         fh.writelines(lines)
 
 
 def _read_tsv(path: Path) -> list[dict]:
-    lines = path.read_text().splitlines()
-    header = lines[0].split("\t")
-    return [dict(zip(header, line.split("\t"))) for line in lines[1:] if line]
+    with path.open() as fh:
+        yield from csv.DictReader(fh, delimiter="\t")
 
 
-def _write_tsv(path: Path, rows: list[dict]) -> None:
-    header = list(rows[0])
-    lines = ["\t".join(header)]
-    lines.extend("\t".join(str(row[k]) for k in header) for row in rows)
-    path.write_text("\n".join(lines) + "\n")
+def _write_tsv(path: Path, rows: list[dict], header=None) -> None:
+    header = header or list(rows[0])
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=header, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _manifest_ids(path: Path) -> set[str]:
     rows = _read_tsv(path)
     return {row["sample_id"] for row in rows}
-
-
-def _ordered(rows):
-    seen = []
-    for row in rows:
-        if row["chrom"] not in seen:
-            seen.append(row["chrom"])
-    return seen
-
-
-def _nums(rows, key):
-    out = np.full(len(rows), np.nan)
-    for i, row in enumerate(rows):
-        if row.get(key):
-            out[i] = float(row[key])
-    return out
-
-
-def _nanmean(values):
-    finite = values[np.isfinite(values)]
-    return float(finite.mean()) if len(finite) else float("nan")
-
-
-def _absdiff(pct, obs, mask):
-    sel = mask & np.isfinite(pct) & np.isfinite(obs)
-    if not sel.any():
-        return float("nan")
-    return float(np.mean(np.abs(pct[sel] - obs[sel])))
 
 
 def _num(value) -> str:
@@ -377,6 +495,14 @@ def _num(value) -> str:
 
 def _f(text) -> float:
     return float(text) if text else 0.0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except (OSError, ValueError) as exc:
+        print(f"wgbs-impute: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
